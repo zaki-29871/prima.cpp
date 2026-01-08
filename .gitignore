@@ -141,3 +141,7 @@ poetry.toml
 # fio
 fio_test*
 *.fio
+
+# Project documentation
+CLAUDE.md
+claude_code_prod.sh
