@@ -949,6 +949,12 @@ int main(int argc, char ** argv) {
     if (my_rank == 0) {
         LOG("\n\n");
         gpt_perf_print(ctx, smpl);
+
+        // Print tensor capture stats if enabled
+        if (params.tensor_capture) {
+            llama_print_tensor_capture_stats(ctx);
+        }
+
         write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);
         gpt_sampler_free(smpl);
         llama_free_sockets(ctx, &stop_signal);

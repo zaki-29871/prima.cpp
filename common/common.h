@@ -166,7 +166,7 @@ struct gpt_params {
     uint32_t data_port            =  9000;  // data port for distributed inference
     uint32_t signal_port          =  10000; // signal port for distributed inference
     bool    prefetch              = false; // prefetch layer weights
-    bool    keep_out_in_metal     =  true; // whether to keep output weights in metal memory, true by default
+    bool    keep_out_in_metal     = true; // whether to keep output weights in metal memory, true by default
     bool    keep_out_in_cuda      = false; // whether to run the output layer on CUDA, false by default
     bool    force                 = false; // force to start prefetching after computation
     float   master_priority       =  1.01; // priority to assign workload to the master (set 1.01 to use master first, and 0.99 to offload to other devices)
@@ -181,7 +181,10 @@ struct gpt_params {
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
     float   p_split               =  0.1f; // speculative decoding split probability
+
+    int32_t n_cpu_layers          =     0; // number of layers to store in RAM (0 - do not use by default)
     int32_t n_gpu_layers          =     0; // number of layers to store in VRAM (0 - do not use by default)
+    
     int32_t n_gpu_layers_draft    =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t main_gpu              =     0; // the GPU that is used for scratch and small tensors
     float   tensor_split[128]     =   {0}; // how split tensors should be distributed across GPUs
@@ -215,7 +218,9 @@ struct gpt_params {
     struct gpt_sampler_params sparams;
     struct common_params_speculative speculative;
 
-    std::string model                = ""; // model path                                                    // NOLINT
+    std::string model                = ""; // model path (legacy, will use CPU model if model_cpu/model_gpu not specified) // NOLINT
+    std::string model_cpu            = ""; // CPU model path (for mixed precision loading)                 // NOLINT  
+    std::string model_gpu            = ""; // GPU model path (for mixed precision loading)                 // NOLINT
     std::string model_alias          = "unknown"; // model alias                                            // NOLINT
     std::string model_url            = ""; // model url to download                                         // NOLINT
     std::string hf_token             = ""; // HF token                                                      // NOLINT
@@ -369,6 +374,9 @@ struct gpt_params {
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;
+
+    // tensor capture for adaptive quantization
+    bool tensor_capture = false; // enable tensor input capture for variance calculation
 };
 
 // call once at the start of a program if it uses libcommon

@@ -149,21 +149,25 @@ static void gpt_params_handle_model_default(gpt_params & params) {
     if (!params.hf_repo.empty()) {
         // short-hand to avoid specifying --hf-file -> default it to --model
         if (params.hf_file.empty()) {
-            if (params.model.empty()) {
-                throw std::invalid_argument("error: --hf-repo requires either --hf-file or --model\n");
+            if (params.model.empty() && params.model_cpu.empty() && params.model_gpu.empty()) {
+                params.model = fs_get_cache_file(string_split(params.hf_file, '/').back());
             }
-            params.hf_file = params.model;
-        } else if (params.model.empty()) {
+        } else if (params.model.empty() && params.model_cpu.empty() && params.model_gpu.empty()) {
             params.model = fs_get_cache_file(string_split(params.hf_file, '/').back());
         }
     } else if (!params.model_url.empty()) {
-        if (params.model.empty()) {
+        if (params.model.empty() && params.model_cpu.empty() && params.model_gpu.empty()) {
             auto f = string_split(params.model_url, '#').front();
-            f = string_split(f, '?').front();
+            f = f.substr(f.find_last_of('/') + 1);
             params.model = fs_get_cache_file(string_split(f, '/').back());
         }
-    } else if (params.model.empty()) {
+    } else if (params.model.empty() && params.model_cpu.empty() && params.model_gpu.empty()) {
         params.model = DEFAULT_MODEL_PATH;
+    }
+    
+    if (!params.model.empty() && params.model_cpu.empty() && params.model_gpu.empty()) {
+        params.model_cpu = params.model;
+        params.model_gpu = params.model;
     }
 }
 
@@ -880,6 +884,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.sparams.no_perf = true;
         }
     ).set_env("LLAMA_ARG_NO_PERF"));
+    add_opt(llama_arg(
+        {"--tensor-capture"},
+        format("enable tensor input capture for adaptive quantization (default: %s)", params.tensor_capture ? "true" : "false"),
+        [](gpt_params & params) {
+            params.tensor_capture = true;
+        }
+    ).set_env("LLAMA_ARG_TENSOR_CAPTURE"));
     add_opt(llama_arg(
         {"-f", "--file"}, "FNAME",
         "a file containing the prompt (default: none)",
@@ -1716,6 +1727,20 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.model = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
+    add_opt(llama_arg(
+        {"-cm", "--cpu-model"}, "FNAME",
+        "CPU model path (for mixed precision loading, takes precedence over --model for CPU)",
+        [](gpt_params & params, const std::string & value) {
+            params.model_cpu = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_CPU_MODEL"));
+    add_opt(llama_arg(
+        {"-gm", "--gpu-model"}, "FNAME", 
+        "GPU model path (for mixed precision loading, takes precedence over --model for GPU)",
+        [](gpt_params & params, const std::string & value) {
+            params.model_gpu = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_GPU_MODEL"));
     add_opt(llama_arg(
         {"-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",

@@ -1667,25 +1667,72 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     params.n_gpu_layers  = 0;
 #endif
 
+    // mixed_precision is only true when CPU and GPU use different model files
+    bool mixed_precision = !params.model_cpu.empty() && !params.model_gpu.empty() && params.model_cpu != params.model_gpu;
+
+    LOG_INF("%s: mixed_precision = %s on this machine\n", __func__, mixed_precision ? "enabled" : "disabled");
+
+    // Specify the model bit width to be loaded into RAM and VRAM
+    llama_model_loader * ml_cpu = nullptr; 
+    llama_model_loader * ml_gpu = nullptr;
+
+    llama_model_loader * ml = nullptr;
+
     llama_init_result iparams;
     auto mparams = llama_model_params_from_gpt_params(params);
 
     struct llama_model * model = nullptr;
 
-    if (!params.hf_repo.empty() && !params.hf_file.empty()) {
-        model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
-    } else if (!params.model_url.empty()) {
-        model = llama_load_model_from_url(params.model_url.c_str(), params.model.c_str(), params.hf_token.c_str(), mparams);
+    if (mixed_precision) {
+
+        std::string base_model_path = params.model_cpu;  
+        
+        if (!params.hf_repo.empty() && !params.hf_file.empty()) {
+            model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), 
+                                            base_model_path.c_str(), params.hf_token.c_str(), mparams);
+        } else if (!params.model_url.empty()) {
+            model = llama_load_model_from_url(params.model_url.c_str(), base_model_path.c_str(), 
+                                            params.hf_token.c_str(), mparams);
+        } else {
+            model = llama_load_model_from_file(base_model_path.c_str(), mparams);
+        }
+        
+        if (model == NULL) {
+            LOG_ERR("%s: failed to load base model structure from '%s'\n", __func__, base_model_path.c_str());
+            return iparams;
+        }
+        
+        ml_cpu = llama_model_load(params.model_cpu.c_str(), model, &mparams);
+        ml_gpu = llama_model_load(params.model_gpu.c_str(), model, &mparams);
+        
+        if (ml_cpu == NULL || ml_gpu == NULL) {
+            LOG_ERR("%s: failed to create model loaders for mixed precision\n", __func__);
+            if (ml_cpu) delete ml_cpu;
+            if (ml_gpu) delete ml_gpu;
+            return iparams;
+        }
+        
     } else {
-        model = llama_load_model_from_file(params.model.c_str(), mparams);
+        std::string model_path = !params.model.empty() ? params.model : 
+                                (!params.model_cpu.empty() ? params.model_cpu : params.model_gpu);
+        
+        if (!params.hf_repo.empty() && !params.hf_file.empty()) {
+            model = llama_load_model_from_hf(params.hf_repo.c_str(), params.hf_file.c_str(), 
+                                            model_path.c_str(), params.hf_token.c_str(), mparams);
+        } else if (!params.model_url.empty()) {
+            model = llama_load_model_from_url(params.model_url.c_str(), model_path.c_str(), 
+                                            params.hf_token.c_str(), mparams);
+        } else {
+            model = llama_load_model_from_file(model_path.c_str(), mparams);
+        }
+        
+        if (model == NULL) {
+            LOG_ERR("%s: failed to load model '%s'\n", __func__, model_path.c_str());
+            return iparams;
+        }
+        
+        ml = llama_model_load(model_path.c_str(), model, &mparams);
     }
-
-    if (model == NULL) {
-        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.c_str());
-        return iparams;
-    }
-
-    llama_model_loader * ml = llama_model_load(params.model.c_str(), model, &mparams);
 
     if (params.reranking) {
         bool ok = true;
@@ -1720,6 +1767,11 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     struct llama_context_params cparams = llama_context_params_from_gpt_params(params);
     llama_context * lctx                = llama_new_context_with_model(model, cparams);
 
+    // Apply tensor capture setting
+    if (params.tensor_capture) {
+        llama_set_tensor_capture(lctx, true);
+    }
+
     if (n_world == 1) {
         uint32_t n_layers = llama_model_n_layers(model);
         
@@ -1731,8 +1783,27 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_update_context_with_rankworld(lctx, 0, 1, 0, 1);
 
 #if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA)
-        params.n_gpu_layers = std::min((int32_t)n_layers, params.n_gpu_layers);
+        // For mixed precision inference, use smart layer allocation
+        if (mixed_precision) {
+            // Use smart layer allocation for optimal GPU/CPU distribution
+            mixed_precision_layer_allocation(&params, model, n_layers, ml_cpu, ml_gpu);
+        } else {
+            // Standard single precision mode
+            params.n_gpu_layers = std::min((int32_t)n_layers, params.n_gpu_layers);
+            params.n_cpu_layers = n_layers - params.n_gpu_layers;
+        }
+        
         cparams.n_gpu_layers = params.n_gpu_layers;
+        cparams.n_cpu_layers = params.n_cpu_layers;
+        mparams.n_gpu_layers = params.n_gpu_layers;
+        mparams.n_cpu_layers = params.n_cpu_layers;
+#else
+        // No GPU support, all layers on CPU
+        params.n_cpu_layers = n_layers;
+        params.n_gpu_layers = 0;
+        cparams.n_cpu_layers = params.n_cpu_layers;
+        cparams.n_gpu_layers = params.n_gpu_layers;
+        mparams.n_cpu_layers = params.n_cpu_layers; 
         mparams.n_gpu_layers = params.n_gpu_layers;
 #endif
 
@@ -1891,9 +1962,16 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         }
     }
 
-    LOG_INF("\nUsing window size: %d, GPU layers: %d\n\n", cparams.n_layer_window[my_rank], cparams.n_gpu_layers);
+    
 
-    if (!mparams.vocab_only && llm_load_tensors(ml, model, mparams) < 0) {
+    // LOG_INF("\nUsing window size: %d, GPU layers: %d, CPU layers: %d\n",cparams.n_layer_window[my_rank], cparams.n_gpu_layers, cparams.n_cpu_layers);
+
+    // Create loader context based on precision mode
+    llama_model_loader_context loader_ctx = mixed_precision ?
+        llama_model_loader_context(ml_cpu, ml_gpu) :
+        llama_model_loader_context(ml);
+
+    if (!mparams.vocab_only && llm_load_tensors(loader_ctx, model, mparams) < 0) {
         LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.c_str());
         llama_free(lctx);
         llama_free_model(model);
@@ -1956,7 +2034,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         params.sparams.ignore_eos = false;
     }
 
-    if (params.warmup) {
+    if (false) {
         LOG_WRN("%s: warming up the model with an empty run - please wait ...\n", __func__);
 
         const uint32_t my_rank = cparams.rank;

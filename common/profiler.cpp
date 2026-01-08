@@ -3,7 +3,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "llama.h"
+#include "common.h"
 #include <sys/stat.h>
+#include <algorithm>
+#include <cmath>
 
 #if defined(_WIN32) || defined(_WIN64)
     #include <windows.h>
@@ -47,6 +50,13 @@
 #include <unordered_map>
 #include <dirent.h>
 
+// Constants
+static const size_t kiB = 1024;
+static const size_t MiB = 1024*kiB;
+static const size_t GiB = 1024*MiB;
+
+
+constexpr uint64_t kUnlimitedMemory = UINT64_MAX;
 
 static int gcd_int(int a, int b) {
     while (b != 0) {
@@ -583,16 +593,22 @@ static uint64_t device_host_physical_memory(bool available) {
 static uint64_t read_value_from_file(const char * path) {
     std::ifstream file(path);
     if (!file.is_open()) {
-        return 0;
+        return kUnlimitedMemory;
     }
+
     std::string line;
     if (!std::getline(file, line)) {
-        return 0;
+        return kUnlimitedMemory;
     }
+
+    if (line == "max") {               
+        return kUnlimitedMemory;
+    }
+
     try {
         return std::stoull(line);
     } catch (...) {
-        return 0;
+        return kUnlimitedMemory;
     }
 }
 
@@ -620,66 +636,56 @@ static std::unordered_map<std::string, uint64_t> read_memory_stat() {
 }
 
 static uint64_t device_cgroup_physical_memory(bool available) {
-    const char * file_path = nullptr;
+    constexpr uint64_t kUNLIMITED = UINT64_MAX;
 
     bool is_cgroup_v2 = false;
     {
-        std::ifstream cgroup_file("/proc/cgroups");
-        if (cgroup_file.is_open()) {
-            std::string line;
-            while (std::getline(cgroup_file, line)) {
-                if (line.find("0") != std::string::npos) {
-                    is_cgroup_v2 = true;
-                    break;
-                }
+        std::ifstream mi("/proc/self/mountinfo");
+        std::string l;
+        while (std::getline(mi, l)) {
+            if (l.find(" - cgroup2 ") != std::string::npos) {
+                is_cgroup_v2 = true;
+                break;
             }
         }
     }
-
+    
+    auto read_or_host = [&](const char *path) -> uint64_t {
+        uint64_t v = read_value_from_file(path);
+        return v == kUNLIMITED ? device_host_physical_memory(false) : v;
+    };
+   
     if (!available) {
-        if (is_cgroup_v2) {
-            file_path = "/sys/fs/cgroup/memory.max";
-        } else {
-            file_path = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
-        }
-        return read_value_from_file(file_path);
-    } else {
-        if (is_cgroup_v2) {
-            uint64_t mem_max     = read_value_from_file("/sys/fs/cgroup/memory.max");
-            uint64_t mem_current = read_value_from_file("/sys/fs/cgroup/memory.current");
-
-            if (mem_max == UINT64_MAX) {
-                mem_max = device_host_physical_memory(false);
-            }
-
-            uint64_t mem_low = read_value_from_file("/sys/fs/cgroup/memory.low");
-
-            auto stats = read_memory_stat();
-
-            uint64_t slab_reclaimable = 0;
-            uint64_t mmap_file        = 0;
-
-            if (stats.find("slab_reclaimable") != stats.end()) {
-                slab_reclaimable = stats["slab_reclaimable"];
-            }
-            if (stats.find("file") != stats.end()) {
-                mmap_file = stats["file"];
-            }
-
-            uint64_t available_memory = mem_max - mem_current;
-            if (mem_low > 0 && available_memory < mem_low) {
-                available_memory = mem_low;
-            }
-            available_memory += slab_reclaimable * 0.5 + mmap_file * 0.5;
-            
-            return available_memory < mem_max ? available_memory : mem_max;
-        } else {
-            LOG_WRN("Using cgroup v1, the available memory could be error, will be addressed later\n");
-            uint64_t mem_limit = read_value_from_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-            uint64_t mem_usage = read_value_from_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-            return mem_limit - mem_usage > 0 ? mem_limit - mem_usage : 0;
-        }
+        return is_cgroup_v2
+               ? read_or_host("/sys/fs/cgroup/memory.max")               // v2
+               : read_or_host("/sys/fs/cgroup/memory/memory.limit_in_bytes"); // v1
     }
+   
+    if (is_cgroup_v2) {
+        uint64_t mem_max     = read_or_host("/sys/fs/cgroup/memory.max");
+        uint64_t mem_current = read_value_from_file("/sys/fs/cgroup/memory.current");
+        uint64_t mem_low     = read_value_from_file("/sys/fs/cgroup/memory.low");
+
+        
+        auto stats = read_memory_stat();
+        uint64_t slab_reclaimable = stats.count("slab_reclaimable") ? stats["slab_reclaimable"] : 0;
+        uint64_t mmap_file        = stats.count("file")             ? stats["file"]             : 0;
+
+        uint64_t available_memory = mem_max > mem_current ? mem_max - mem_current : 0;
+        if (mem_low > 0 && available_memory < mem_low) {
+            available_memory = mem_low;
+        }
+        available_memory += static_cast<uint64_t>(slab_reclaimable * 0.5 + mmap_file * 0.5);
+
+        return std::min(available_memory, mem_max);
+    }
+
+    //  v1 
+    LOG_WRN("Using cgroup v1, the available memory may be inaccurate, will be addressed later\n");
+    uint64_t mem_limit = read_or_host("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    uint64_t mem_usage = read_value_from_file("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+
+    return mem_limit > mem_usage ? mem_limit - mem_usage : 0;
 }
 
 uint64_t device_physical_memory(bool available) {
@@ -2861,4 +2867,120 @@ size_t TopoRebuildHelperInfo::serialize(char ** buffer) const{
     free(*buffer);
     *buffer = buffer_;
     return buffer_size + 1;
+}
+
+// layer allocation for mixed precision inference
+void mixed_precision_layer_allocation(struct gpt_params * params, struct llama_model * model, uint32_t n_layers,
+                                     struct llama_model_loader * cpu_ml, struct llama_model_loader * gpu_ml) {
+    LOG_INF("\n");
+    LOG_INF("========================================\n");
+    LOG_INF("Using MIXED PRECISION mode\n");
+    LOG_INF("========================================\n");
+    LOG_INF("CPU model: %s\n", params->model_cpu.c_str());
+    LOG_INF("GPU model: %s\n", params->model_gpu.c_str());
+    LOG_INF("\n");
+
+    // Use user-specified GPU layers if provided
+    if (params->n_gpu_layers > 0) {
+        params->n_cpu_layers = n_layers - params->n_gpu_layers;
+        if (params->n_cpu_layers < 0) {
+            params->n_cpu_layers = 0;
+        }
+        LOG_INF("Using user-specified GPU layers: %d, CPU layers: %d\n", 
+                params->n_gpu_layers, params->n_cpu_layers);
+        return;
+    }
+
+    // Auto allocation logic
+    size_t available_vram = 0;
+    size_t total_vram = 0;
+    size_t available_ram = 0;
+
+    // Use rounding to avoid floating point precision issues
+    size_t model_size_cpu = (size_t)(get_model_size_from_loader(cpu_ml) * 1024 * 1024 * 1024 + 0.5);
+    size_t model_size_gpu = (size_t)(get_model_size_from_loader(gpu_ml) * 1024 * 1024 * 1024 + 0.5);
+
+    // Calculate layer sizes with proper rounding
+    size_t layer_size_cpu = (model_size_cpu + n_layers - 1) / n_layers;  // Ceiling division
+    size_t layer_size_gpu = (model_size_gpu + n_layers - 1) / n_layers;  // Ceiling division
+
+    LOG_INF("%s: CPU layer size = %.2f MiB\n", 
+                  __func__, layer_size_cpu / (double)MiB);
+    LOG_INF("%s: GPU layer size = %.2f MiB\n", 
+                  __func__, layer_size_gpu / (double)MiB);
+    
+    // Get actual GPU memory info
+#if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA)
+    ggml_backend_dev_props gpu_props;
+    try {
+        device_get_props(model, 0, &gpu_props);
+        // Use actual device memory instead of buffer size
+        available_vram = gpu_props.memory_free;
+        total_vram = gpu_props.memory_total;
+    } catch (...) {
+        LOG_WRN("Failed to get GPU memory info, falling back to CPU-only mode\n");
+        available_vram = 0;
+        total_vram = 0;
+    }
+#endif
+
+    // Get actual CPU memory info
+    available_ram = device_host_physical_memory(true);
+
+    size_t kv_cache_per_layer = 0;
+    if (model && llama_n_ctx_train(model) > 0) {
+        // per layer KV cache = 2 * n_ctx * n_embd * sizeof(float16) / n_layers
+        size_t n_ctx = params->n_ctx ? params->n_ctx : llama_n_ctx_train(model);
+        size_t n_embd = llama_n_embd(model);
+        // Use safe division to avoid floating point issues
+        kv_cache_per_layer = n_layers > 0 ? (2 * n_ctx * n_embd * 2 + n_layers - 1) / n_layers : 0;  // 2 bytes per fp16
+        
+        LOG_INF("%s: KV cache per layer = %.2f MiB\n", 
+                      __func__, kv_cache_per_layer / (double)MiB);
+    }
+
+    int32_t gpu_layers = 0;
+    int32_t cpu_layers = 0;
+
+    size_t vram_budget = (size_t)(available_vram);
+    size_t ram_budget  = (size_t)(available_ram);
+
+    // Total memory per layer (weights + KV cache)
+    size_t gpu_layer_total = layer_size_gpu + kv_cache_per_layer;
+    size_t cpu_layer_total = layer_size_cpu + kv_cache_per_layer;
+
+    // Maximize GPU layers within VRAM budget - ensure integer division
+    if (gpu_layer_total == 0) {
+        gpu_layers = 0;
+    } else {
+        gpu_layers = (int32_t)std::min((size_t)n_layers, vram_budget / gpu_layer_total);
+    }
+    cpu_layers = (int32_t)n_layers - gpu_layers;
+
+    // Use safe multiplication to avoid integer overflow
+    size_t vram_used = (gpu_layer_total > 0 && gpu_layers > 0) ?
+                       (size_t)gpu_layers * gpu_layer_total : 0;
+    size_t ram_used  = (cpu_layer_total > 0 && cpu_layers > 0) ?
+                       (size_t)cpu_layers * cpu_layer_total : 0;
+
+    // If RAM insufficient, move layers from CPU to GPU
+    while (ram_used > ram_budget && cpu_layers > 0) {
+        if (vram_used + gpu_layer_total > vram_budget) {
+            // GPU also out of memory
+            break;
+        }
+        gpu_layers++;
+        cpu_layers--;
+        // Update memory usage safely
+        vram_used = (gpu_layer_total > 0 && gpu_layers > 0) ?
+                   (size_t)gpu_layers * gpu_layer_total : 0;
+        ram_used  = (cpu_layer_total > 0 && cpu_layers > 0) ?
+                   (size_t)cpu_layers * cpu_layer_total : 0;
+    }
+
+    params->n_gpu_layers = gpu_layers;
+    params->n_cpu_layers = cpu_layers;
+    
+    LOG_INF("%s: Final allocation - GPU layers: %d, CPU layers: %d\n", 
+                  __func__, params->n_gpu_layers, params->n_cpu_layers);
 }

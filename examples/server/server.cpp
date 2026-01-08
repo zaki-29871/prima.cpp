@@ -33,6 +33,7 @@
 #include "loading.html.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cinttypes>
@@ -657,6 +658,11 @@ struct server_context {
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+
+    // Batch timing tracking for concurrent requests
+    std::chrono::high_resolution_clock::time_point batch_start_time;
+    int active_batch_count = 0;
+    bool batch_timing_started = false;
 
     ~server_context() {
         if (ctx) {
@@ -1998,6 +2004,29 @@ struct server_context {
             system_prompt_update();
         }
 
+        // Track batch timing for concurrent requests
+        {
+            int current_processing_count = 0;
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    current_processing_count++;
+                }
+            }
+
+            // Check if batch just started (transition from 0 to >0 active slots)
+            if (!batch_timing_started && current_processing_count > 0) {
+                batch_timing_started = true;
+                active_batch_count = current_processing_count;
+                batch_start_time = std::chrono::high_resolution_clock::now();
+                SRV_INF("batch processing started: %d concurrent requests\n", current_processing_count);
+            }
+            // Update the maximum concurrent count during this batch
+            else if (batch_timing_started && current_processing_count > active_batch_count) {
+                active_batch_count = current_processing_count;
+                SRV_INF("batch processing updated: %d concurrent requests (increased)\n", current_processing_count);
+            }
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2010,6 +2039,18 @@ struct server_context {
             }
 
             if (all_idle) {
+                // Log batch completion timing if batch was active
+                if (batch_timing_started) {
+                    auto batch_end_time = std::chrono::high_resolution_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(batch_end_time - batch_start_time);
+                    SRV_INF("batch processing completed: %d concurrent requests processed in %ld ms (%.2f seconds)\n", 
+                           active_batch_count, duration.count(), duration.count() / 1000.0);
+                    
+                    // Reset batch tracking
+                    batch_timing_started = false;
+                    active_batch_count = 0;
+                }
+
                 SRV_INF("%s", "all slots are idle\n");
                 if (system_prompt.empty() && clean_kv_cache) {
                     kv_cache_clear();

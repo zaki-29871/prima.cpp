@@ -53,6 +53,9 @@ int main(int argc, char ** argv) {
 
     llama_model_loader * ml = llama_model_load(params.model.c_str(), model, &mparams);
 
+    // Scan tensor min/max values
+    llama_scan_tensor_minmax(ml);
+
     device_info dev_info;
     llama_profile_device(&dev_info, model, ml, params.gpu_mem, params.n_predict, params.n_ctx, params.cpuparams.n_threads, params.flash_attn);
     device_print_props(&dev_info, 1, model, cparams);

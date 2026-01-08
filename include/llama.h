@@ -3,7 +3,11 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <set>
+#include <utility>
 #include "profiler.h"
 
 #include <stddef.h>
@@ -293,7 +297,10 @@ extern "C" {
         uint32_t n_world; // number of nodes
         uint32_t rank; // my node rank
         uint32_t n_layer_window[32]; // number of layers to kept each time
+
+        uint32_t n_cpu_layers; // number of layers to store in RAM
         int32_t  n_gpu_layers; // number of layers to store in VRAM
+
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
         // main_gpu interpretation depends on split_mode:
@@ -334,7 +341,10 @@ extern "C" {
         uint32_t    n_world;           // world size
         uint32_t    rank;              // my rank
         uint32_t    n_layer_window[32];// number of layers to process in each compute
+        
         uint32_t    n_gpu_layers;      // number of layers to process on GPU
+        uint32_t    n_cpu_layers;      // number of layers to process on CPU
+
         uint32_t    n_cycles;          // number of cycles to output one token
         bool        prefetch;          // whether to prefetch layer weights
         bool        force;             // force to start prefetching after computation
@@ -421,6 +431,20 @@ extern "C" {
     // lora adapter
     struct llama_lora_adapter;
 
+    struct llama_model_loader_context {
+        struct llama_model_loader * primary;   // Primary loader (single precision only, or CPU in mixed precision)
+        struct llama_model_loader * secondary; // Secondary loader (GPU in mixed precision mode only)
+        bool is_mixed_precision;
+
+        // Single precision constructor
+        explicit llama_model_loader_context(struct llama_model_loader * ml)
+            : primary(ml), secondary(nullptr), is_mixed_precision(false) {}
+
+        // Mixed precision constructor
+        llama_model_loader_context(struct llama_model_loader * ml_cpu, struct llama_model_loader * ml_gpu)
+            : primary(ml_cpu), secondary(ml_gpu), is_mixed_precision(true) {}
+};
+
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggerganov/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
@@ -485,9 +509,9 @@ extern "C" {
     LLAMA_API int  llama_recv_layer_setup  (struct llama_context * ctx, uint32_t * n_layer_window, uint32_t * n_gpu_layers);
 
     LLAMA_API int llm_load_tensors(
-              struct llama_model_loader * ml,
-              struct llama_model        * model,
-              struct llama_model_params   params);
+              const struct llama_model_loader_context & loader_ctx,
+              struct llama_model                        * model,
+              struct llama_model_params                   params);
     
     LLAMA_API void llama_update_context_with_rankworld(
                    struct llama_context * ctx, 
@@ -558,6 +582,12 @@ extern "C" {
 
     LLAMA_API struct llama_model_loader * llama_model_load(const char * fname, struct llama_model * model, struct llama_model_params * params);
 
+    // Get model size from loader (returns GiB)
+    LLAMA_API double get_model_size_from_loader(struct llama_model_loader * ml);
+
+    // Scan all tensors in the model loader and print min/max values
+    LLAMA_API void llama_scan_tensor_minmax(struct llama_model_loader * ml);
+
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
 
@@ -609,8 +639,8 @@ extern "C" {
 
     // Return the total number of float operations in the model
     LLAMA_API void llama_model_n_flops(
-                        struct llama_model * model, 
-                 struct llama_model_loader * ml, 
+                        struct llama_model * model,
+              const struct llama_model_loader_context & loader_ctx,
                         struct model_flops * n_flops,
                        struct model_params * n_params,
                         struct model_bytes * n_bytes,
@@ -1388,6 +1418,61 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
     LLAMA_API void llama_perf_dump_yaml(FILE * stream, const struct llama_context * ctx);
+
+    //
+    // Tensor capture for adaptive quantization
+    //
+
+    /// @details Enable or disable tensor capture functionality.
+    ///          When enabled, input tensors to specific linear layers will be captured
+    ///          during graph evaluation and their variance will be computed.
+    /// @param ctx The llama context
+    /// @param enable true to enable, false to disable
+    LLAMA_API void llama_set_tensor_capture(struct llama_context * ctx, bool enable);
+
+    /// @details Get the tensor capture enable status
+    /// @param ctx The llama context
+    /// @returns true if tensor capture is enabled, false otherwise
+    LLAMA_API bool llama_get_tensor_capture(const struct llama_context * ctx);
+
+    /// @details Get the number of captured tensors
+    /// @param ctx The llama context
+    /// @returns The number of unique tensors that have been captured
+    LLAMA_API size_t llama_get_tensor_capture_count(const struct llama_context * ctx);
+
+    /// @details Get captured tensor data by index
+    /// @param ctx The llama context
+    /// @param idx The index of the captured tensor (0 to count-1)
+    /// @param name_out Output buffer for the tensor name (can be NULL)
+    /// @param name_size Size of the name output buffer
+    /// @param variance_out Output buffer for variance values (can be NULL)
+    /// @param variance_size Size of the variance output buffer (number of doubles)
+    /// @param sample_count_out Output pointer for the sample count (can be NULL)
+    /// @returns The number of variance values available, or 0 on error
+    LLAMA_API size_t llama_get_tensor_capture_data(
+            const struct llama_context * ctx,
+            size_t idx,
+            char * name_out,
+            size_t name_size,
+            double * variance_out,
+            size_t variance_size,
+            size_t * sample_count_out);
+
+    /// @details Clear all captured tensor data
+    /// @param ctx The llama context
+    LLAMA_API void llama_clear_tensor_capture(struct llama_context * ctx);
+
+    /// @details Get the overall variance for a captured tensor (all tokens, all elements)
+    /// @param ctx The llama context
+    /// @param tensor_name The tensor name (e.g., "blk.0.attn_q.in")
+    /// @returns The overall variance, or -1.0 if tensor not found
+    LLAMA_API double llama_get_tensor_overall_variance(
+        const struct llama_context * ctx,
+        const char * tensor_name);
+
+    /// @details Print captured tensor statistics
+    /// @param ctx The llama context
+    LLAMA_API void llama_print_tensor_capture_stats(const struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

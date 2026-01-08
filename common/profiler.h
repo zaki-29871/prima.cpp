@@ -406,6 +406,9 @@ float    device_cuda_read_vram_bw ();
 void     device_get_props         (struct llama_model * model, int device, struct ggml_backend_dev_props * props); 
 void     device_print_props       (struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams);
 
+void     mixed_precision_layer_allocation(struct gpt_params * params, struct llama_model * model, uint32_t n_layers,
+                                         struct llama_model_loader * cpu_ml = nullptr, struct llama_model_loader * gpu_ml = nullptr);
+
 int      device_has_metal  (void);
 int      device_has_cuda   (void);
 int      device_has_vulkan (void);
