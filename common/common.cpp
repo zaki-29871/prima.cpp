@@ -2152,6 +2152,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.keep_out_in_cuda  = params.keep_out_in_cuda;
     cparams.n_gpu_layers      = params.n_gpu_layers;
     cparams.n_cycles          = params.n_cycles;
+    cparams.is_perplexity_eval= params.is_perplexity_eval;
     std::copy(std::begin(params.n_layer_window), std::end(params.n_layer_window), cparams.n_layer_window);
 
     if (cparams.master_ip != nullptr) {
@@ -2167,7 +2168,6 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     }
     cparams.next_node_ip      = new char[params.next_node_ip.length() + 1];
     std::strcpy(cparams.next_node_ip, params.next_node_ip.c_str());
-
     cparams.n_ctx             = params.n_ctx;
     cparams.n_predict         = params.n_predict;
     cparams.n_seq_max         = params.n_parallel;

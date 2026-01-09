@@ -55,7 +55,6 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-
 constexpr uint64_t kUnlimitedMemory = UINT64_MAX;
 
 static int gcd_int(int a, int b) {

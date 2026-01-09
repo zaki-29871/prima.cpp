@@ -1,7 +1,7 @@
 #include "arg.h"
+#include "llama.h"
 #include "common.h"
 #include "log.h"
-#include "llama.h"
 
 #include <algorithm>
 #include <array>
@@ -473,6 +473,10 @@ static results_perplexity perplexity_v2(llama_context * ctx, const gpt_params & 
 }
 
 static results_perplexity perplexity(llama_context * ctx, const gpt_params & params, const int32_t n_ctx) {
+    uint32_t my_rank = params.rank;
+    uint32_t n_world = params.n_world;
+    bool is_last_dev = (my_rank == n_world - 1);
+    
     if (params.ppl_stride > 0) {
         return perplexity_v2(ctx, params);
     }
@@ -486,41 +490,104 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
     GGML_ASSERT(!llama_add_eos_token(llama_get_model(ctx)));
 
     std::ofstream logits_stream;
-    if (!params.logits_file.empty()) {
-        logits_stream.open(params.logits_file.c_str(), std::ios::binary);
-        if (!logits_stream.is_open()) {
-            LOG_ERR("%s: failed to open %s for writing\n", __func__, params.logits_file.c_str());
-            return {};
+    if (my_rank == 0) { 
+        if (!params.logits_file.empty()) {
+            logits_stream.open(params.logits_file.c_str(), std::ios::binary);
+            if (!logits_stream.is_open()) {
+                LOG_ERR("%s: failed to open %s for writing\n", __func__, params.logits_file.c_str());
+                return {};
+            }
+            LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
+            logits_stream.write("_logits_", 8);
+            logits_stream.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
         }
-        LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
-        logits_stream.write("_logits_", 8);
-        logits_stream.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
     }
 
-    auto tim1 = std::chrono::high_resolution_clock::now();
-    LOG_INF("%s: tokenizing the input ..\n", __func__);
+    std::vector<llama_token> tokens;
+    size_t tokens_size = 0;
+    int n_chunks = params.n_chunks;
 
-    std::vector<llama_token> tokens = ::llama_tokenize(ctx, params.prompt, true);
+    if (my_rank == 0) {
+        auto tim1 = std::chrono::high_resolution_clock::now();
+        LOG_INF("%s: rank %d tokenizing the input (this may take 1-2 seconds)...\n", __func__, my_rank);
 
-    auto tim2 = std::chrono::high_resolution_clock::now();
-    LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
+        tokens = ::llama_tokenize(ctx, params.prompt, true);
+        tokens_size = tokens.size();
 
-    if (int(tokens.size()) < 2*n_ctx) {
-        LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,2*n_ctx,
+        auto tim2 = std::chrono::high_resolution_clock::now();
+        LOG_INF("%s: rank %d tokenization completed in %g ms, tokens_size = %zu\n", __func__, my_rank, 
+                1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count(), tokens_size);
+    }
+
+    if (my_rank != 0) {
+        LOG_INF("perplexity: rank %d waiting for rank 0 to be ready\n", my_rank);
+    }
+
+    if (n_world > 1) {
+        sync_meta meta;
+        
+        if (my_rank != 0) {
+            // Initial synchronization with extended retry mechanism for tokenization wait
+            int retry_count = 0;
+            const int max_retries = 10;  // More retries for initialization
+            bool recv_success = false;
+            
+            LOG_INF("rank %d: waiting for initial sync (tokenization may take time)...\n", my_rank);
+            
+            while (retry_count < max_retries && !recv_success) {
+                if (llama_recv_meta(ctx, &meta) == 0) {
+                    recv_success = true;
+                    LOG_INF("rank %d: successfully received initial sync on attempt %d\n", my_rank, retry_count + 1);
+                } else {
+                    retry_count++;
+                    LOG_WRN("rank %d: failed to recv initial sync, retry %d/%d (tokenization may still be in progress)\n", 
+                           my_rank, retry_count, max_retries);
+                    // Longer delay for initialization phase
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+                }
+            }
+            
+            if (!recv_success) {
+                LOG_ERR("rank %d: failed to recv initial sync after %d retries (total wait time: %d seconds)\n", 
+                       my_rank, max_retries, max_retries * 2);
+                return { {}, -1.0, {}, {} };
+            }
+            
+            tokens_size = meta.tokens_size;
+            n_chunks    = meta.n_chunks;
+        }
+
+        if (!is_last_dev) {
+            if (my_rank == 0) {
+                meta.tokens_size = tokens_size;
+                meta.n_chunks    = params.n_chunks;
+            }
+            llama_send_meta(ctx, &meta);
+        }
+    }
+
+    LOG_INF("%s: rank %d synchronized tokens_size = %zu\n", __func__, my_rank, tokens_size);
+
+    if (my_rank == 0) {
+        if (int(tokens.size()) < 2*n_ctx) {
+            LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,2*n_ctx,
                 n_ctx);
-        LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
-        return {std::move(tokens), 0., {}, {}};
+            LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
+            return {std::move(tokens), 0., {}, {}};
+        }
     }
 
     std::vector<float> logit_history;
-    logit_history.resize(tokens.size());
-
     std::vector<float> prob_history;
-    prob_history.resize(tokens.size());
 
-    const int n_chunk_max = tokens.size() / n_ctx;
+    if (my_rank == 0) {
+        logit_history.resize(tokens_size);
+        prob_history.resize(tokens_size);
+    }
 
-    const int n_chunk = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
+    const int n_chunk_max = tokens_size / n_ctx;
+
+    const int n_chunk = n_chunks < 0 ? n_chunk_max : std::min(n_chunks, n_chunk_max);
     const int n_vocab = llama_n_vocab(llama_get_model(ctx));
     const int n_batch = params.n_batch;
 
@@ -537,23 +604,35 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
 
     std::vector<float> logits;
-    if (num_batches > 1) {
-        logits.reserve((size_t)n_ctx * n_vocab);
+
+    if((my_rank == 0 || is_last_dev)){
+        if (num_batches > 1) {
+            logits.reserve((size_t)n_ctx * n_vocab);
+            LOG_INF("%s: rank %d reserved logits space for %zu elements\n", 
+                    __func__, my_rank, (size_t)n_ctx * n_vocab);
+        }
     }
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
     std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
-    std::vector<uint16_t> log_probs;
-    if (!params.logits_file.empty()) {
-        logits_stream.write((const char *)&n_vocab, sizeof(n_vocab));
-        logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
-        logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
+    std::vector<uint16_t> log_probs; // the log probabilities of logits 
+
+    // only rank 0 stores logits/log_probs
+    if (!params.logits_file.empty() && (my_rank == 0)) {
         const int nv = 2*((n_vocab + 1)/2) + 4;
         log_probs.resize(n_ctx * nv);
-    }
 
+        // additional operations only for rank 0 or single device
+        if (my_rank == 0) {
+            // For single device, is_last_dev and my_rank==0 are both true
+            // For multiple devices, only rank 0 will write these headers
+            logits_stream.write((const char *)&n_vocab, sizeof(n_vocab));
+            logits_stream.write((const char *)&n_chunk, sizeof(n_chunk)); 
+            logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
+        }
+    }
     // We get the logits for all the tokens in the context window (params.n_ctx)
     // from llama_eval above.  Now, based on https://huggingface.co/docs/transformers/perplexity,
     // calculate the perplexity over the last half of the window (so the model always has
@@ -576,56 +655,162 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
 
         const auto t_start = std::chrono::high_resolution_clock::now();
 
+        {
+            // synchronize the KV cache clear signal across all ranks
+            if (n_world > 1) {
+                sync_meta clear_meta; 
+                clear_meta.clear_kv_cache = true;
+
+                if (my_rank == 0) {
+                    // Rank 0 sends the signal
+                    llama_send_meta(ctx, &clear_meta);
+                } else {
+                    // Non-rank 0 devices receive the signal with retry mechanism
+                    int retry_count = 0;
+                    const int max_retries = 5;
+                    bool recv_success = false;
+                    
+                    while (retry_count < max_retries && !recv_success) {
+                        if (llama_recv_meta(ctx, &clear_meta) == 0) {
+                            recv_success = true;
+                        } else {
+                            retry_count++;
+                            LOG_WRN("Failed to recv clear_kv_cache signal on rank %d, retry %d/%d\n", 
+                                   my_rank, retry_count, max_retries);
+                            // Small delay before retry
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                    }
+                    
+                    if (!recv_success) {
+                        LOG_ERR("Failed to recv clear_kv_cache signal on rank %d after %d retries\n", 
+                               my_rank, max_retries);
+                        return {tokens, -1.0, {}, {}};
+                    }
+                    
+                    // Forward the signal to next rank if not the last device
+                    if (!is_last_dev) {
+                        llama_send_meta(ctx, &clear_meta);
+                    }
+                }
+            }
+        }
         // clear the KV cache
         llama_kv_cache_clear(ctx);
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
             const int batch_size  = std::min(end - batch_start, n_batch);
+            // used for communication of the batch meta data
+            sync_meta meta;
+            
+            int n_outputs = 0; 
 
-            int n_outputs = 0;
+            // only rank 0 constructs the batch, other ranks just receive it
+            if (my_rank == 0){
 
-            batch.n_tokens = 0;
-            for (int seq = 0; seq < n_seq_batch; seq++) {
-                int seq_start = batch_start + seq*n_ctx;
+                batch.n_tokens = 0;
 
-                // save original token and restore it after eval
-                const auto token_org = tokens[seq_start];
+                for (int seq = 0; seq < n_seq_batch; seq++) {
+                    int seq_start = batch_start + seq*n_ctx;
 
-                // add BOS token for the first batch of each chunk
-                if (add_bos && j == 0) {
-                    tokens[seq_start] = llama_token_bos(llama_get_model(ctx));
+                    // save original token and restore it after eval
+                    const auto token_org = tokens[seq_start];
+
+                    // add BOS token for the first batch of each chunk
+                    if (add_bos && j == 0) {
+                        tokens[seq_start] = llama_token_bos(llama_get_model(ctx));
+                    }
+
+                    for (int k = 0; k < batch_size; ++k) {
+                        const int idx = seq*n_ctx + k;
+
+                        batch.token   [idx]    = tokens[seq_start + k];
+                        batch.pos     [idx]    = j*n_batch + k;
+                        batch.n_seq_id[idx]    = 1;
+                        batch.seq_id  [idx][0] = seq;
+                        batch.logits  [idx]    = batch.pos[idx] >= first ? 1 : 0;
+
+                        n_outputs += batch.logits[idx] != 0;
+
+                    }
+                    batch.n_tokens += batch_size;
+
+                    // restore the original token in case it was set to BOS
+                    tokens[seq_start] = token_org;
                 }
-
-                for (int k = 0; k < batch_size; ++k) {
-                    const int idx = seq*n_ctx + k;
-                    batch.token   [idx]    = tokens[seq_start + k];
-                    batch.pos     [idx]    = j*n_batch + k;
-                    batch.n_seq_id[idx]    = 1;
-                    batch.seq_id  [idx][0] = seq;
-                    batch.logits  [idx]    = batch.pos[idx] >= first ? 1 : 0;
-
-                    n_outputs += batch.logits[idx] != 0;
-                }
-                batch.n_tokens += batch_size;
-
-                // restore the original token in case it was set to BOS
-                tokens[seq_start] = token_org;
+                
+                // comms: now rank 0 need to send the batch to other ranks
+                meta.n_tokens  = batch.n_tokens;
+                meta.pos       = batch.pos;
+                meta.n_seq_id  = batch.n_seq_id;
+                meta.seq_id    = batch.seq_id;
+                meta.logits    = batch.logits;
+                meta.n_outputs = n_outputs;
             }
+
+            // Chain forwarding pattern: consistent with tokens_size communication
+            if (n_world > 1) {
+                if (my_rank != 0) {
+                    // Non-rank 0 devices receive batch meta data with retry mechanism
+                    int retry_count = 0;
+                    const int max_retries = 3;
+                    bool recv_success = false;
+                    
+                    while (retry_count < max_retries && !recv_success) {
+                        if (llama_recv_meta(ctx, &meta) == 0) {
+                            recv_success = true;
+                        } else {
+                            retry_count++;
+                            LOG_WRN("Failed to recv batch meta on rank %d, retry %d/%d\n", 
+                                   my_rank, retry_count, max_retries);
+                            // Small delay before retry
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                    }
+                    
+                    if (!recv_success) {
+                        LOG_ERR("Failed to recv batch meta on rank %d after %d retries\n", 
+                               my_rank, max_retries);
+                        return {tokens, -1.0, {}, {}};
+                    }
+                    
+                    // copy the batch meta data to the llama_batch
+                    if (meta.n_tokens > 0) {
+                        batch.n_tokens = meta.n_tokens;
+                        if (meta.pos)      { std::memcpy(batch.pos,      meta.pos,      meta.n_tokens * sizeof(llama_pos)); } // use n_tokens instead of n_batch, n_tokens is the actual number of tokens in the batch
+                        if (meta.n_seq_id) { std::memcpy(batch.n_seq_id, meta.n_seq_id, meta.n_tokens * sizeof(int32_t));   }
+                        if (meta.seq_id)   {
+                            const int32_t n_seq_max = 1;
+                            for (int32_t i = 0; i < meta.n_tokens; ++i) {
+                                std::memcpy(batch.seq_id[i], meta.seq_id[i], n_seq_max * sizeof(llama_seq_id));
+                            }
+                        }
+                        if (meta.logits)   { std::memcpy(batch.logits,   meta.logits,   meta.n_tokens * sizeof(int8_t));    }
+                    }
+                }
+
+                if (!is_last_dev) {
+                    // Non-last devices forward the batch meta data
+                    llama_send_meta(ctx, &meta);
+                }
+            }   
 
             if (llama_decode(ctx, batch)) {
                 LOG_INF("%s : failed to eval\n", __func__);
                 return {tokens, -1, logit_history, prob_history};
             }
 
-            if (num_batches > 1 && n_outputs > 0) {
-                const auto * batch_logits = llama_get_logits(ctx);
-                logits.insert(logits.end(), batch_logits, batch_logits + n_outputs * n_vocab);
+            if (my_rank == 0 && num_batches > 1 && n_outputs > 0) {
+                const int n_outputs_synced = meta.n_outputs; 
+                if (n_outputs_synced > 0) {
+                     const auto * batch_logits = llama_get_logits(ctx);
+                     logits.insert(logits.end(), batch_logits, batch_logits + n_outputs_synced * n_vocab);
+                }
             }
         }
 
-
-        if (i == 0) {
+        if (my_rank == 0 && i == 0) {
             llama_synchronize(ctx);
             const auto t_end = std::chrono::high_resolution_clock::now();
             const float t_total = std::chrono::duration<float>(t_end - t_start).count();
@@ -638,53 +823,71 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
             LOG("%.2f minutes\n", total_seconds / 60.0);
         }
 
-        for (int seq = 0; seq < n_seq_batch; seq++) {
-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+        if (my_rank == 0) {
+            for (int seq = 0; seq < n_seq_batch; seq++) {
+                const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+                
+                llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+                if (!params.logits_file.empty()) {
+                    process_logits(logits_stream, n_vocab, all_logits,
+                            tokens_data, n_ctx - 1 - first,
+                            workers, log_probs, nll, nll2);
+                } else {
+                    process_logits(n_vocab, all_logits,
+                            tokens_data, n_ctx - 1 - first,
+                            workers, nll, nll2,
+                            logit_history.data() + start + seq*n_ctx + first,
+                            prob_history.data()  + start + seq*n_ctx + first);
+                }
+                count += n_ctx - first - 1;
 
-            llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
-            if (!params.logits_file.empty()) {
-                process_logits(logits_stream, n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, log_probs, nll, nll2);
-            } else {
-                process_logits(n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, nll, nll2,
-                        logit_history.data() + start + seq*n_ctx + first,
-                        prob_history.data()  + start + seq*n_ctx + first);
+                // perplexity is e^(average negative log-likelihood)
+                if (params.ppl_output_type == 0) {
+                    LOG("[%d]%.4lf,", i + seq + 1, std::exp(nll / count));
+                } else {
+                    double av = nll/count;
+                    double av2 = nll2/count - av*av;
+                    if (av2 > 0) av2 = sqrt(av2/(count-1));
+                    LOG("%8d  %.4lf  %4lf  %4lf\n", i*n_ctx, std::exp(nll / count), av, av2);
+                }
             }
-            count += n_ctx - first - 1;
-
-            // perplexity is e^(average negative log-likelihood)
-            if (params.ppl_output_type == 0) {
-                LOG("[%d]%.4lf,", i + seq + 1, std::exp(nll / count));
-            } else {
-                double av = nll/count;
-                double av2 = nll2/count - av*av;
-                if (av2 > 0) av2 = sqrt(av2/(count-1));
-                LOG("%8d  %.4lf  %4lf  %4lf\n", i*n_ctx, std::exp(nll / count), av, av2);
-            }
+            logits.clear();
         }
 
-        logits.clear();
+        if (my_rank == 0) {
+            double current_ppl = std::exp(nll / count);
+            double progress = ((double)(i + n_seq_batch)) / n_chunk * 100.0;
+            
+            LOG_INF("Rank 0: Chunk %d/%d (%.1f%%) completed, current_ppl = %.4lf\n", 
+                    i + n_seq_batch, n_chunk, progress, current_ppl);
+        } else {
+            double progress = ((double)(i + n_seq_batch)) / n_chunk * 100.0;
+            
+            LOG_INF("Rank %d: Chunk %d/%d (%.1f%%) completed\n", 
+                    my_rank, i + n_seq_batch, n_chunk, progress);
+        }
     }
     LOG("\n");
 
-    nll2 /= count;
-    nll /= count;
-    const double ppl = exp(nll);
-    nll2 -= nll * nll;
-    if (nll2 > 0) {
-        nll2 = sqrt(nll2/(count-1));
-        LOG_INF("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2*ppl);
-    } else {
-        LOG_ERR("Unexpected negative standard deviation of log(prob)\n");
+    if (my_rank == 0) {
+        nll2 /= count;
+        nll /= count;
+        const double ppl = exp(nll);
+        nll2 -= nll * nll;
+
+        if (nll2 > 0) {
+            nll2 = sqrt(nll2/(count-1));
+            LOG_INF("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2*ppl);
+        } else {
+            LOG_ERR("Unexpected negative standard deviation of log(prob)\n");
+        }
+        llama_batch_free(batch);
+        return {tokens, ppl, logit_history, prob_history};
     }
 
     llama_batch_free(batch);
-
-    return {tokens, ppl, logit_history, prob_history};
-}
+    return {};
+} 
 
 static bool decode_helper(llama_context * ctx, llama_batch & batch, std::vector<float> & batch_logits, int32_t n_batch, int32_t n_vocab) {
     int prev_outputs = 0;
@@ -1960,9 +2163,27 @@ int main(int argc, char ** argv) {
     params.n_ctx = 512;
     params.logits_all = true;
     params.escape = false;
+    params.is_perplexity_eval = true;
 
     if (!gpt_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
         return 1;
+    } 
+
+    uint32_t n_world  = params.n_world;
+    uint32_t my_rank  = params.rank;
+    GGML_ASSERT(!(n_world == 1 && my_rank > 0));
+
+    // check if --n-layer-window and --world is matched
+    if (my_rank == 0) {
+        uint32_t non_zero_count = 0;
+        size_t size = sizeof(params.n_layer_window) / sizeof(params.n_layer_window[0]);
+        for (size_t i = 0; i < size; ++i) {
+            if (params.n_layer_window[i] != 0) {
+                ++non_zero_count;
+            }
+        }
+        GGML_ASSERT((non_zero_count == 0 || non_zero_count == n_world) \
+            && "Number of non-zero values in --n-layer-window must equal --world");
     }
 
     gpt_init();
@@ -2006,6 +2227,11 @@ int main(int argc, char ** argv) {
     // load the model and apply lora adapter, if any
     llama_init_result llama_init = llama_init_from_gpt_params(params);
 
+    my_rank = params.rank;
+    n_world = params.n_world;
+
+    bool is_last_dev = (my_rank == n_world - 1);
+
     llama_model * model = llama_init.model;
     llama_context * ctx = llama_init.context;
     if (model == NULL) {
@@ -2026,6 +2252,13 @@ int main(int argc, char ** argv) {
         LOG_INF("%s\n", gpt_params_get_system_info(params).c_str());
     }
 
+    char * stop_signal = nullptr;
+    std::thread signal_thread;
+
+    if (my_rank != 0) {
+        signal_thread = std::thread(llama_free_sockets, ctx, &stop_signal);
+    }
+
     struct results_perplexity results;
     if (params.hellaswag) {
         hellaswag_score(ctx, params);
@@ -2040,13 +2273,38 @@ int main(int argc, char ** argv) {
     }
 
     LOG("\n");
-    llama_perf_context_print(ctx);
+    
+    
+    if (my_rank == 0) {
+        write_logfile(ctx, params, model, results);
+        llama_perf_context_print(ctx);
+    }  
 
-    write_logfile(ctx, params, model, results);
+    if (n_world > 1) {
+        LOG_INF("Rank %d: Entering distributed shutdown protocol.\n", my_rank);
+
+        if (my_rank == 0) {
+            char * rank0_stop_signal = nullptr;
+            llama_free_sockets(ctx, &rank0_stop_signal);
+            
+            if (rank0_stop_signal) {
+                LOG_INF("Rank %d: Cleanup signal received: %s\n", my_rank, rank0_stop_signal);
+                delete[] rank0_stop_signal;
+            }
+        }
+
+        if (my_rank != 0 && signal_thread.joinable()) {
+            signal_thread.join();
+        }
+
+        if (stop_signal) {
+            LOG_INF("Rank %d: Cleanup signal received: %s\n", my_rank, stop_signal);
+            delete[] stop_signal;
+        }
+    }
 
     llama_free(ctx);
     llama_free_model(model);
-
     llama_backend_free();
 
     return 0;

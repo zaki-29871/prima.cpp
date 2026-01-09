@@ -200,6 +200,8 @@ struct gpt_params {
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
     float   defrag_thold          = -1.0f; // KV cache defragmentation threshold
 
+    bool is_perplexity_eval;
+
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
     struct cpu_params draft_cpuparams;
@@ -574,9 +576,9 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
 // Split utils
 //
 
-static const char * const LLM_KV_SPLIT_NO            = "split.no";
-static const char * const LLM_KV_SPLIT_COUNT         = "split.count";
-static const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
+extern const char * const LLM_KV_SPLIT_NO;
+extern const char * const LLM_KV_SPLIT_COUNT;
+extern const char * const LLM_KV_SPLIT_TENSORS_COUNT;
 
 //
 // YAML utils
