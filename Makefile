@@ -953,7 +953,8 @@ OBJ_LLAMA = \
 	src/llama-grammar.o \
 	src/llama-sampling.o \
 	src/unicode.o \
-	src/unicode-data.o
+	src/unicode-data.o \
+	src/network-utils.o
 
 OBJ_COMMON = \
 	common/profiler.o \
@@ -963,6 +964,7 @@ OBJ_COMMON = \
 	common/console.o \
 	common/ngram-cache.o \
 	common/sampling.o \
+	common/speculative.o \
 	common/train.o \
 	common/build-info.o \
 	common/json-schema-to-grammar.o
@@ -1143,6 +1145,11 @@ src/unicode-data.o: \
 	src/unicode-data.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+src/network-utils.o: \
+	src/network-utils.cpp \
+	src/network-utils.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 src/llama.o: \
 	src/llama.cpp \
 	src/llama-impl.h \
@@ -1150,6 +1157,7 @@ src/llama.o: \
 	src/llama-grammar.h \
 	src/llama-sampling.h \
 	src/unicode.h \
+	src/network-utils.h \
 	include/llama.h \
 	ggml/include/ggml-cuda.h \
 	ggml/include/ggml-metal.h \
@@ -1231,6 +1239,12 @@ common/console.o: \
 common/json-schema-to-grammar.o: \
 	common/json-schema-to-grammar.cpp \
 	common/json-schema-to-grammar.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+common/speculative.o: \
+	common/speculative.cpp \
+	common/speculative.h \
+	include/llama.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 common/train.o: \

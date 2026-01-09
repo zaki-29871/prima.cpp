@@ -16913,72 +16913,39 @@ int llama_recv_meta(llama_context * ctx, struct sync_meta * meta) {
         } else if (key == "n_outputs") {
             GGML_ASSERT(data_msg.size() == sizeof(meta->n_outputs));
             std::memcpy(&(meta->n_outputs), data_msg.data(), sizeof(meta->n_outputs));
-        } else if (key == "pos") {
-            meta->pos = (llama_pos *) malloc(meta->n_tokens * sizeof(llama_pos));
-            std::memcpy(meta->pos, data_msg.data(), meta->n_tokens * sizeof(llama_pos));
-        } else if (key == "n_seq_id") {
-            GGML_ASSERT(meta->n_tokens > 0);
-            GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(int32_t));
-            meta->n_seq_id = (int32_t *) malloc(meta->n_tokens * sizeof(int32_t));
-            std::memcpy(meta->n_seq_id, data_msg.data(), meta->n_tokens * sizeof(int32_t));
-        } else if (key == "seq_id") {
-            GGML_ASSERT(meta->n_tokens > 0);
-            GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(llama_seq_id));
-            const llama_seq_id * all_seq_ids = (llama_seq_id *) data_msg.data();
-            meta->seq_id = (llama_seq_id **) malloc(meta->n_tokens * sizeof(llama_seq_id *));
-            for (int32_t i = 0; i < meta->n_tokens; ++i) {
-                meta->seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id));
-                meta->seq_id[i][0] = all_seq_ids[i];
-            }
-        } else if (key == "logits") {
-            GGML_ASSERT(meta->n_tokens > 0);
-            GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(int8_t));
-            meta->logits = (int8_t *) malloc(meta->n_tokens * sizeof(int8_t));
-            std::memcpy(meta->logits, data_msg.data(), meta->n_tokens * sizeof(int8_t));
-        }
-        else if (key == "n_ctx") {
+        } else if (key == "n_ctx") {
             GGML_ASSERT(data_msg.size() == sizeof(meta->n_ctx));
             std::memcpy(&(meta->n_ctx), data_msg.data(), sizeof(meta->n_ctx));
-        }
-        else if (key == "all_pos_0") {
+        } else if (key == "all_pos_0") {
             GGML_ASSERT(data_msg.size() == sizeof(meta->all_pos_0));
             std::memcpy(&(meta->all_pos_0), data_msg.data(), sizeof(meta->all_pos_0));
-        }
-        else if (key == "all_pos_1") {
+        } else if (key == "all_pos_1") {
             GGML_ASSERT(data_msg.size() == sizeof(meta->all_pos_1));
             std::memcpy(&(meta->all_pos_1), data_msg.data(), sizeof(meta->all_pos_1));
-        }
-        else if (key == "pos") {
+        } else if (key == "pos") {
             if (meta->n_tokens > 0) {
                 meta->pos = (llama_pos *) malloc(meta->n_tokens * sizeof(llama_pos));
                 GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(llama_pos));
                 std::memcpy(meta->pos, data_msg.data(), meta->n_tokens * sizeof(llama_pos));
             }
-        }
-        else if (key == "n_seq_id") {
+        } else if (key == "n_seq_id") {
             if (meta->n_tokens > 0) {
                 meta->n_seq_id = (int32_t *) malloc(data_msg.size());
                 std::memcpy(meta->n_seq_id, data_msg.data(), meta->n_tokens * sizeof(int32_t));
             }
-        }
-        // batch.logits
-        else if (key == "seq_id") {
+        } else if (key == "seq_id") {
             if (meta->n_tokens > 0) {
-                const int32_t n_tokens = meta->n_tokens; 
-                const int32_t n_seq_max = 1; 
-
+                const int32_t n_tokens = meta->n_tokens;
+                const int32_t n_seq_max = 1;
                 GGML_ASSERT(data_msg.size() == (size_t)n_tokens * n_seq_max * sizeof(llama_seq_id));
-
                 meta->seq_id = (llama_seq_id **) malloc(n_tokens * sizeof(llama_seq_id *));
-        
                 const llama_seq_id * flat_data = (const llama_seq_id *)data_msg.data();
                 for (int32_t token_idx = 0; token_idx < n_tokens; ++token_idx) {
                     meta->seq_id[token_idx] = (llama_seq_id *) malloc(n_seq_max * sizeof(llama_seq_id));
                     std::memcpy(meta->seq_id[token_idx], flat_data + token_idx * n_seq_max, n_seq_max * sizeof(llama_seq_id));
                 }
             }
-        }
-        else if (key == "logits") {
+        } else if (key == "logits") {
             if (meta->n_tokens > 0) {
                 GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(int8_t));
                 meta->logits = (int8_t *) malloc(meta->n_tokens * sizeof(int8_t));

@@ -95,6 +95,9 @@ struct sync_meta {
     llama_pos    cp_p0         = 0;
     llama_pos    cp_p1         = 0;
 
+    bool         kv_seq_keep   = false;
+    llama_seq_id keep_seq_id   = 0;
+
     // signal to divide the kv cache range
     bool         kv_seq_div    = false;
     llama_seq_id div_seq_id    = 0;
