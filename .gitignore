@@ -145,3 +145,5 @@ fio_test*
 # Project documentation
 CLAUDE.md
 claude_code_prod.sh
+# Generated statistics files (CSV)
+*.csv
