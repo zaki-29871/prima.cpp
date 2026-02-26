@@ -163,9 +163,11 @@ struct gpt_params {
     uint32_t n_layer_window[32]   =   {0}; // layer window size on each node
     std::string master_ip         = "127.0.0.1"; // ip address of the master node
     std::string next_node_ip      = "127.0.0.1"; // ip address of my next node
-    uint32_t data_port            =  9000;  // data port for distributed inference
-    uint32_t signal_port          =  10000; // signal port for distributed inference
+    uint32_t data_port            =  9005;  // data port for distributed inference
+    uint32_t signal_port          =  10032; // signal port for distributed inference
     bool    prefetch              = false; // prefetch layer weights
+    bool    ada_quant             = false; // enable adaptive quantization mode (use CSV statistics instead of model profiling)
+    bool    test_sensitivity      = false; // test layer sensitivity calculation (requires --ada-quant)
     bool    keep_out_in_metal     = true; // whether to keep output weights in metal memory, true by default
     bool    keep_out_in_cuda      = false; // whether to run the output layer on CUDA, false by default
     bool    force                 = false; // force to start prefetching after computation
@@ -576,9 +578,9 @@ llama_control_vector_data llama_control_vector_load(const std::vector<llama_cont
 // Split utils
 //
 
-extern const char * const LLM_KV_SPLIT_NO;
-extern const char * const LLM_KV_SPLIT_COUNT;
-extern const char * const LLM_KV_SPLIT_TENSORS_COUNT;
+static const char * const LLM_KV_SPLIT_NO            = "split.no";
+static const char * const LLM_KV_SPLIT_COUNT         = "split.count";
+static const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 
 //
 // YAML utils
@@ -591,3 +593,48 @@ void yaml_dump_string_multiline(FILE * stream, const char * prop_name, const cha
 void yaml_dump_non_result_info(
     FILE * stream, const gpt_params & params, const llama_context * lctx,
     const std::string & timestamp, const std::vector<int> & prompt_tokens, const char * model_desc);
+
+//
+// Mixed precision layer allocation
+//
+
+void mixed_precision_layer_allocation(struct gpt_params * params, struct llama_model * model, uint32_t n_layers,
+                                     struct llama_model_loader * cpu_ml = nullptr, struct llama_model_loader * gpu_ml = nullptr);
+
+//
+// Device layer allocation
+//
+
+struct device_info;
+struct llama_context_params;
+struct bitwidth_allocation;
+
+// Core adaptive bitwidth allocation function (MILP optimization with HiGHS)
+bool assign_layers_to_device_adaptive(
+                                uint32_t   n_world,
+                       const device_info * dev_info_set,
+                      struct llama_model * model,
+       const struct llama_context_params   cparams,
+                             bitwidth_allocation & result,
+                       const std::vector<int> & bitwidth_set,
+                                   double   quality_budget,
+                                   float   min_disk_read_speed = 0.1f);
+
+// Legacy function with weak device filtering (kept for compatibility)
+bool assign_layers_and_select_devices(
+                                uint32_t   n_world,
+                std::vector<device_info>   dev_infos,
+                                uint32_t * n_layer_window,
+                                uint32_t * n_gpu_layers,
+                      struct llama_model * model,
+       const struct llama_context_params   cparams);
+
+// Simplified layer allocation with 1D output arrays (for ada_quant tool)
+bool assign_layers_to_device(
+                                uint32_t   n_world,
+                       const device_info * dev_info_set,
+                                uint32_t * n_layer_window,
+                                uint32_t * n_gpu_layers,
+                      struct llama_model * model,
+       const struct llama_context_params   cparams,
+                                   float   min_disk_read_speed = 0.1f);

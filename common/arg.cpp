@@ -162,7 +162,10 @@ static void gpt_params_handle_model_default(gpt_params & params) {
             params.model = fs_get_cache_file(string_split(f, '/').back());
         }
     } else if (params.model.empty() && params.model_cpu.empty() && params.model_gpu.empty()) {
-        params.model = DEFAULT_MODEL_PATH;
+        // Skip default model path in ada-quant offline mode
+        if (!params.ada_quant) {
+            params.model = DEFAULT_MODEL_PATH;
+        }
     }
     
     if (!params.model.empty() && params.model_cpu.empty() && params.model_gpu.empty()) {
@@ -763,6 +766,20 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.prefetch = true;
         }
     ).set_env("LLAMA_ARG_UNLOAD"));
+    add_opt(llama_arg(
+        {"--ada-quant"},
+        format("enable adaptive quantization mode (use CSV statistics instead of model profiling, default: %s)", params.ada_quant ? "true" : "false"),
+        [](gpt_params & params) {
+            params.ada_quant = true;
+        }
+    ).set_env("LLAMA_ARG_ADA_QUANT"));
+    add_opt(llama_arg(
+        {"--test-sensitivity"},
+        "test layer sensitivity calculation (requires --ada-quant)",
+        [](gpt_params & params) {
+            params.test_sensitivity = true;
+        }
+    ).set_env("LLAMA_ARG_TEST_SENSITIVITY"));
     add_opt(llama_arg(
         {"-gm", "--gpu-mem"}, "N", 
         format("maximum GPU memory to use (default: %d)", params.gpu_mem),

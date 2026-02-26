@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <cmath>
+#include <cfloat>  // for DBL_MAX
 
 #if defined(_WIN32) || defined(_WIN64)
     #include <windows.h>
@@ -171,9 +172,10 @@ uint32_t device_cpu_cores() {
     return core_count;
 }
 
-static float device_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads) {
+float device_flops_internal(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads, int n_embd_override) {
     int n_repeat = 1;
-    int n_embd   = std::min(llama_n_embd(model), 4096);
+    // Use n_embd_override if provided, otherwise get from model or default to 4096
+    int n_embd   = n_embd_override > 0 ? n_embd_override : (model ? std::min(llama_n_embd(model), 4096) : 4096);
 
     // simulate small tensor calculation on cpu
     if (btype == PROFILER_BACKEND_TYPE_CPU) n_embd /= 8;
@@ -311,14 +313,14 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
 }
 
 float device_cpu_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads) {
-    return device_flops(model, src0t, src1t, PROFILER_BACKEND_TYPE_CPU, n_threads);
+    return device_flops_internal(model, src0t, src1t, PROFILER_BACKEND_TYPE_CPU, n_threads, 0);
 }
 
 float device_metal_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t) {
     float flops = 0.0f;
 
 #ifdef GGML_USE_METAL
-    flops = device_flops(model, src0t, src1t, PROFILER_BACKEND_TYPE_METAL, 4);
+    flops = device_flops_internal(model, src0t, src1t, PROFILER_BACKEND_TYPE_METAL, 4, 0);
 #endif
 
     (void)model;
@@ -331,7 +333,7 @@ float device_cuda_flops(struct llama_model * model, enum ggml_type src0t, enum g
     float flops = 0.0f;
 
 #ifdef GGML_USE_CUDA
-    flops = device_flops(model, src0t, src1t, PROFILER_BACKEND_TYPE_CUDA, 4);
+    flops = device_flops_internal(model, src0t, src1t, PROFILER_BACKEND_TYPE_CUDA, 4, 0);
 #endif
 
     (void)model;
@@ -502,7 +504,7 @@ static int is_uma_arch() {
 #endif
 }
 
-static uint64_t device_host_physical_memory(bool available) {
+uint64_t device_host_physical_memory(bool available) {
     uint64_t memory = 0;
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -1337,6 +1339,106 @@ float device_cuda_mem_copy(struct llama_model * model) {
     return delay;
 }
 
+static float device_cuda_pcie_bw_internal() {
+#if defined(__linux__) && defined(GGML_USE_CUDA)
+    LOG_INF("%s: Starting PCIe bandwidth measurement...\n", __func__);
+    // Use 100 MiB for accurate bandwidth measurement
+    const size_t buffer_size = 100ULL * 1024 * 1024;  // 100 MiB
+
+    // Allocate pinned host memory for better PCIe transfer performance
+    float *host_mem = nullptr;
+    bool used_pinned_memory = false;
+    cudaError_t err = cudaMallocHost(&host_mem, buffer_size);
+    if (err != cudaSuccess) {
+        LOG_INF("%s: cudaMallocHost failed, falling back to malloc: %s\n", __func__, cudaGetErrorString(err));
+        host_mem = (float *)malloc(buffer_size);
+        if (!host_mem) {
+            LOG_INF("%s: malloc failed\n", __func__);
+            return 0.0f;
+        }
+        used_pinned_memory = false;
+    } else {
+        used_pinned_memory = true;
+    }
+
+    // Initialize host memory
+    for (size_t i = 0; i < buffer_size / sizeof(float); ++i) {
+        host_mem[i] = static_cast<float>(i);
+    }
+
+    // Allocate device memory
+    float *device_mem = nullptr;
+    err = cudaMalloc(&device_mem, buffer_size);
+    if (err != cudaSuccess) {
+        LOG_INF("%s: cudaMalloc failed: %s\n", __func__, cudaGetErrorString(err));
+        if (used_pinned_memory) {
+            cudaFreeHost(host_mem);
+        } else {
+            free(host_mem);
+        }
+        return 0.0f;
+    }
+
+    // Warm-up transfers
+    cudaMemcpy(device_mem, host_mem, buffer_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(host_mem, device_mem, buffer_size, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    // Measure Host-to-Device bandwidth
+    const int h2d_iters = 5;
+    int64_t h2d_start = ggml_time_us();
+    for (int i = 0; i < h2d_iters; ++i) {
+        cudaMemcpy(device_mem, host_mem, buffer_size, cudaMemcpyHostToDevice);
+    }
+    cudaDeviceSynchronize();
+    int64_t h2d_end = ggml_time_us();
+    double h2d_bw = (buffer_size * h2d_iters) / (((double)(h2d_end - h2d_start)) / 1e6) / 1e9; // GB/s
+
+    // Measure Device-to-Host bandwidth
+    const int d2h_iters = 5;
+    int64_t d2h_start = ggml_time_us();
+    for (int i = 0; i < d2h_iters; ++i) {
+        cudaMemcpy(host_mem, device_mem, buffer_size, cudaMemcpyDeviceToHost);
+    }
+    cudaDeviceSynchronize();
+    int64_t d2h_end = ggml_time_us();
+    double d2h_bw = (buffer_size * d2h_iters) / (((double)(d2h_end - d2h_start)) / 1e6) / 1e9; // GB/s
+
+    // Use minimum bandwidth as conservative estimate
+    float pcie_bw = static_cast<float>(std::min(h2d_bw, d2h_bw));
+
+    // Cleanup
+    cudaFree(device_mem);
+    if (used_pinned_memory) {
+        cudaFreeHost(host_mem);
+    } else {
+        free(host_mem);
+    }
+
+    LOG_INF("%s: PCIe bandwidth measured: H2D=%.2f GB/s, D2H=%.2f GB/s, using min=%.2f GB/s\n",
+            __func__, h2d_bw, d2h_bw, pcie_bw);
+
+    return pcie_bw;
+#else
+    // Only supported on Linux with CUDA
+    LOG_INF("%s: Not supported (requires Linux + CUDA)\n", __func__);
+    return 0.0f;
+#endif
+}
+
+float device_cuda_pcie_bw() {
+    float bw = 0.0f;
+
+#ifdef GGML_USE_CUDA
+    LOG_INF("%s: Measuring CUDA PCIe bandwidth...\n", __func__);
+    bw = device_cuda_pcie_bw_internal();
+#else
+    LOG_INF("%s: CUDA support not compiled in\n", __func__);
+#endif
+
+    return bw;
+}
+
 int device_has_metal(void) {
     return ggml_cpu_has_metal();
 }
@@ -1394,6 +1496,7 @@ static float device_compute_delay(struct device_info & dev_info, int n_layers, c
     gpu_latency_per_layer += (double)n_flops.layer_q5k_f32    / ((double)gpu.cuda_flops_q5k_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_q6k_f32    / ((double)gpu.cuda_flops_q6k_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_iq2xxs_f32 / ((double)gpu.cuda_flops_iq2xxs_f32 + EPS) / 1e9;
+    gpu_latency_per_layer += (double)n_flops.layer_iq2xs_f32  / ((double)gpu.cuda_flops_iq2xs_f32  + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_q50_f32    / ((double)gpu.cuda_flops_q50_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_q80_f32    / ((double)gpu.cuda_flops_q80_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_iq1s_f32   / ((double)gpu.cuda_flops_iq1s_f32   + EPS) / 1e9;
@@ -1409,6 +1512,7 @@ static float device_compute_delay(struct device_info & dev_info, int n_layers, c
     gpu_latency_per_layer += (double)n_flops.layer_q5k_f32    / ((double)gpu.metal_flops_q5k_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_q6k_f32    / ((double)gpu.metal_flops_q6k_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_iq2xxs_f32 / ((double)gpu.metal_flops_iq2xxs_f32 + EPS) / 1e9;
+    gpu_latency_per_layer += (double)n_flops.layer_iq2xs_f32  / ((double)gpu.metal_flops_iq2xs_f32  + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_q50_f32    / ((double)gpu.metal_flops_q50_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_q80_f32    / ((double)gpu.metal_flops_q80_f32    + EPS) / 1e9;
     gpu_latency_per_layer += (double)n_flops.layer_iq1s_f32   / ((double)gpu.metal_flops_iq1s_f32   + EPS) / 1e9;
@@ -1423,6 +1527,7 @@ static float device_compute_delay(struct device_info & dev_info, int n_layers, c
     cpu_latency_per_layer += (double)n_flops.layer_q5k_f32    / ((double)cpu.flops_q5k_f32    + EPS) / 1e9;
     cpu_latency_per_layer += (double)n_flops.layer_q6k_f32    / ((double)cpu.flops_q6k_f32    + EPS) / 1e9;
     cpu_latency_per_layer += (double)n_flops.layer_iq2xxs_f32 / ((double)cpu.flops_iq2xxs_f32 + EPS) / 1e9;
+    cpu_latency_per_layer += (double)n_flops.layer_iq2xs_f32  / ((double)cpu.flops_iq2xs_f32  + EPS) / 1e9;
     cpu_latency_per_layer += (double)n_flops.layer_q50_f32    / ((double)cpu.flops_q50_f32    + EPS) / 1e9;
     cpu_latency_per_layer += (double)n_flops.layer_q80_f32    / ((double)cpu.flops_q80_f32    + EPS) / 1e9;
     cpu_latency_per_layer += (double)n_flops.layer_iq1s_f32   / ((double)cpu.flops_iq1s_f32   + EPS) / 1e9;
@@ -1446,6 +1551,7 @@ static float device_compute_delay(struct device_info & dev_info, int n_layers, c
     total_latency += (double)n_flops.output_q5k_f32    / ((double)cpu.flops_q5k_f32    + EPS) / 1e9;
     total_latency += (double)n_flops.output_q6k_f32    / ((double)cpu.flops_q6k_f32    + EPS) / 1e9;
     total_latency += (double)n_flops.output_iq2xxs_f32 / ((double)cpu.flops_iq2xxs_f32 + EPS) / 1e9;
+    total_latency += (double)n_flops.output_iq2xs_f32  / ((double)cpu.flops_iq2xs_f32  + EPS) / 1e9;
     total_latency += (double)n_flops.output_q50_f32    / ((double)cpu.flops_q50_f32    + EPS) / 1e9;
     total_latency += (double)n_flops.output_q80_f32    / ((double)cpu.flops_q80_f32    + EPS) / 1e9;
     total_latency += (double)n_flops.output_iq1s_f32   / ((double)cpu.flops_iq1s_f32   + EPS) / 1e9;
@@ -1714,7 +1820,7 @@ static float device_mem_copy_delay(struct device_info & dev_info, struct llama_m
 #endif
 }
 
-void device_print_props(struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams) {
+void device_print_props(struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams, bool ada_quant) {
     LOG_INF("\n-------------------------------------------------------------------------------------------\n");
     LOG_INF("| Property                        ");
     for (int i = 0; i < n; ++i) {
@@ -2047,6 +2153,12 @@ void device_print_props(struct device_info * dev_info_set, int n, struct llama_m
     }
     LOG_INF("\n");
 
+    LOG_INF("| CUDA PCIe BW (GB/s)             ");
+    for (int i = 0; i < n; ++i) {
+        LOG_INF("| %-10.2f   ", dev_info_set[i].gpu_props.cuda_pcie_bw);
+    }
+    LOG_INF("\n");
+
     LOG_INF("| CUDA KVCache Copy Time (ms/l)   ");
     for (int i = 0; i < n; ++i) {
         LOG_INF("| %-10.2f   ", dev_info_set[i].gpu_props.cuda_mem_cpy_delay);
@@ -2125,7 +2237,9 @@ void device_print_props(struct device_info * dev_info_set, int n, struct llama_m
     }
     LOG_INF("\n");
 
-    LOG_INF("| Model flops (output F32xF32)    ");
+    if (!ada_quant) {
+        // Skip model flops/params/bytes in ada-quant mode (these values are from model profiling, not CSV statistics)
+        LOG_INF("| Model flops (output F32xF32)    ");
     LOG_INF("| %-10" PRId64 "   ", dev_info_set[0].model_flops.output_f32_f32);
     LOG_INF("\n");
 
@@ -2376,6 +2490,7 @@ void device_print_props(struct device_info * dev_info_set, int n, struct llama_m
     LOG_INF("| Model bytes  (output)           ");
     LOG_INF("| %-10" PRId64 "   ", dev_info_set[0].model_bytes.nb_output);
     LOG_INF("\n");
+    }
 
     // float latency = 0.0f;
     // int n_layers  = llama_model_n_layers (model);
@@ -2416,15 +2531,15 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
                       + gpu_description_len
                       + sizeof(struct disk_props)
                       + sizeof(uint32_t)    // cpu_props.cores
-                      + sizeof(float) * 12  // - cpu_props.flops_f32_f32,   cpu_props.flops_f16_f32,
+                      + sizeof(float) * 13  // - cpu_props.flops_f32_f32,   cpu_props.flops_f16_f32,
                                             // - cpu_props.flops_q2k_f32,   cpu_props.flops_q4k_f32, cpu_props.flops_q5k_f32, cpu_props.flops_q6k_f32
-                                            // - cpu_props.flops_iq2xxs_f32
+                                            // - cpu_props.flops_iq2xxs_f32, cpu_props.flops_iq2xs_f32
                                             // - cpu_props.flops_q50_f32,   cpu_props.flops_q80_f32
                                             // - cpu_props.flops_iq1s_f32,  cpu_props.flops_iq4nl_f32
                                             // - cpu_props.flops_iq1m_f32
                       + sizeof(struct memory_info)
                       + sizeof(struct gpu_support)
-                      + sizeof(float) * 30;     // GPU attributes
+                      + sizeof(float) * 33;     // GPU attributes
                                                 // memory:
                                                 // - memory_free,           memory_total
                                                 // - metal_read_vram_bw,    cuda_read_vram_bw
@@ -2444,6 +2559,7 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
                                                 // - cuda_flops_iq1m_f32
                                                 // delay:
                                                 // - metal_mem_cpy_delay,   cuda_mem_cpy_delay
+                                                // - cuda_pcie_bw           (PCIe bandwidth)
 
     *buffer = (char *)malloc(total_size);
     char * ptr = *buffer;
@@ -2522,6 +2638,9 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
     memcpy(ptr, &dev_info->cpu_props.flops_iq2xxs_f32, sizeof(float));
     ptr += sizeof(float);
 
+    memcpy(ptr, &dev_info->cpu_props.flops_iq2xs_f32, sizeof(float));
+    ptr += sizeof(float);
+
     memcpy(ptr, &dev_info->cpu_props.flops_q50_f32, sizeof(float));
     ptr += sizeof(float);
 
@@ -2573,6 +2692,9 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
     memcpy(ptr, &dev_info->gpu_props.metal_flops_iq2xxs_f32, sizeof(float));
     ptr += sizeof(float);
 
+    memcpy(ptr, &dev_info->gpu_props.metal_flops_iq2xs_f32, sizeof(float));
+    ptr += sizeof(float);
+
     memcpy(ptr, &dev_info->gpu_props.metal_flops_q50_f32, sizeof(float));
     ptr += sizeof(float);
 
@@ -2615,6 +2737,9 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
     memcpy(ptr, &dev_info->gpu_props.cuda_flops_iq2xxs_f32, sizeof(float));
     ptr += sizeof(float);
 
+    memcpy(ptr, &dev_info->gpu_props.cuda_flops_iq2xs_f32, sizeof(float));
+    ptr += sizeof(float);
+
     memcpy(ptr, &dev_info->gpu_props.cuda_flops_q50_f32, sizeof(float));
     ptr += sizeof(float);
 
@@ -2631,6 +2756,9 @@ size_t serialize(const struct device_info * dev_info, char ** buffer) {
     ptr += sizeof(float);
 
     memcpy(ptr, &dev_info->gpu_props.cuda_mem_cpy_delay, sizeof(float));
+    ptr += sizeof(float);
+
+    memcpy(ptr, &dev_info->gpu_props.cuda_pcie_bw, sizeof(float));
 
     // no need to synchronize model flops and model params
     return total_size;
@@ -2727,6 +2855,9 @@ size_t deserialize(const char * buffer, struct device_info * dev_info) {
     memcpy(&dev_info->cpu_props.flops_iq2xxs_f32, ptr, sizeof(float));
     ptr += sizeof(float);
 
+    memcpy(&dev_info->cpu_props.flops_iq2xs_f32, ptr, sizeof(float));
+    ptr += sizeof(float);
+
     memcpy(&dev_info->cpu_props.flops_q50_f32, ptr, sizeof(float));
     ptr += sizeof(float);
 
@@ -2778,6 +2909,9 @@ size_t deserialize(const char * buffer, struct device_info * dev_info) {
     memcpy(&dev_info->gpu_props.metal_flops_iq2xxs_f32, ptr, sizeof(float));
     ptr += sizeof(float);
 
+    memcpy(&dev_info->gpu_props.metal_flops_iq2xs_f32, ptr, sizeof(float));
+    ptr += sizeof(float);
+
     memcpy(&dev_info->gpu_props.metal_flops_q50_f32, ptr, sizeof(float));
     ptr += sizeof(float);
 
@@ -2820,6 +2954,9 @@ size_t deserialize(const char * buffer, struct device_info * dev_info) {
     memcpy(&dev_info->gpu_props.cuda_flops_iq2xxs_f32, ptr, sizeof(float));
     ptr += sizeof(float);
 
+    memcpy(&dev_info->gpu_props.cuda_flops_iq2xs_f32, ptr, sizeof(float));
+    ptr += sizeof(float);
+
     memcpy(&dev_info->gpu_props.cuda_flops_q50_f32, ptr, sizeof(float));
     ptr += sizeof(float);
 
@@ -2836,6 +2973,9 @@ size_t deserialize(const char * buffer, struct device_info * dev_info) {
     ptr += sizeof(float);
 
     memcpy(&dev_info->gpu_props.cuda_mem_cpy_delay, ptr, sizeof(float));
+    ptr += sizeof(float);
+
+    memcpy(&dev_info->gpu_props.cuda_pcie_bw, ptr, sizeof(float));
     ptr += sizeof(float);
 
     // no need to synchronize model flops and model params
@@ -2868,118 +3008,518 @@ size_t TopoRebuildHelperInfo::serialize(char ** buffer) const{
     return buffer_size + 1;
 }
 
-// layer allocation for mixed precision inference
-void mixed_precision_layer_allocation(struct gpt_params * params, struct llama_model * model, uint32_t n_layers,
-                                     struct llama_model_loader * cpu_ml, struct llama_model_loader * gpu_ml) {
-    LOG_INF("\n");
-    LOG_INF("========================================\n");
-    LOG_INF("Using MIXED PRECISION mode\n");
-    LOG_INF("========================================\n");
-    LOG_INF("CPU model: %s\n", params->model_cpu.c_str());
-    LOG_INF("GPU model: %s\n", params->model_gpu.c_str());
-    LOG_INF("\n");
+// ============================================================
+// Model Statistics Loading from CSV
+// ============================================================
 
-    // Use user-specified GPU layers if provided
-    if (params->n_gpu_layers > 0) {
-        params->n_cpu_layers = n_layers - params->n_gpu_layers;
-        if (params->n_cpu_layers < 0) {
-            params->n_cpu_layers = 0;
+bool load_model_statistics_from_csv(
+    const char * csv_path,
+    std::vector<model_statistics_entry>& entries
+) {
+    std::ifstream csv_file(csv_path);
+    if (!csv_file.is_open()) {
+        LOG_ERR("%s: failed to open CSV file: %s\n", __func__, csv_path);
+        return false;
+    }
+
+    std::string line;
+    // Skip header
+    std::getline(csv_file, line);
+
+    while (std::getline(csv_file, line)) {
+        std::istringstream ss(line);
+        std::string token;
+        model_statistics_entry entry;
+
+        try {
+            // Parse model_id
+            std::getline(ss, token, ',');
+            entry.model_id = token;
+
+            // Parse output_flops (13 columns)
+            std::getline(ss, token, ','); entry.flops.output_f32_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_f16_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_q2k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_q4k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_q5k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_q6k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_iq2xxs_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_iq2xs_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_q50_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_q80_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_iq1s_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_iq4nl_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.output_iq1m_f32 = std::stoll(token);
+
+            // Parse layer_flops (13 columns)
+            std::getline(ss, token, ','); entry.flops.layer_f32_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_f16_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_q2k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_q4k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_q5k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_q6k_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_iq2xxs_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_iq2xs_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_q50_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_q80_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_iq1s_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_iq4nl_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.flops.layer_iq1m_f32 = std::stoll(token);
+
+            // Parse input params (13 columns)
+            std::getline(ss, token, ','); entry.params.input_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_f16 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_q2k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_q4k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_q5k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_q6k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_iq2xxs = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_iq2xs = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_q50 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_q80 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_iq1s = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_iq4nl = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.input_iq1m = std::stoll(token);
+
+            // Parse layer params (13 columns)
+            std::getline(ss, token, ','); entry.params.layer_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_f16 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_q2k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_q4k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_q5k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_q6k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_iq2xxs = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_iq2xs = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_q50 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_q80 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_iq1s = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_iq4nl = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.layer_iq1m = std::stoll(token);
+
+            // Parse output params (13 columns)
+            std::getline(ss, token, ','); entry.params.output_f32 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_f16 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_q2k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_q4k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_q5k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_q6k = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_iq2xxs = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_iq2xs = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_q50 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_q80 = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_iq1s = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_iq4nl = std::stoll(token);
+            std::getline(ss, token, ','); entry.params.output_iq1m = std::stoll(token);
+
+            // Parse bytes (3 columns)
+            std::getline(ss, token, ','); entry.bytes.nb_input = std::stoll(token);
+            std::getline(ss, token, ','); entry.bytes.nb_layer = std::stoll(token);
+            std::getline(ss, token, ','); entry.bytes.nb_output = std::stoll(token);
+
+            entries.push_back(entry);
+        } catch (const std::exception& e) {
+            LOG_ERR("%s: failed to parse line: %s, error: %s\n", __func__, line.c_str(), e.what());
+            csv_file.close();
+            return false;
         }
-        LOG_INF("Using user-specified GPU layers: %d, CPU layers: %d\n", 
-                params->n_gpu_layers, params->n_cpu_layers);
-        return;
     }
 
-    // Auto allocation logic
-    size_t available_vram = 0;
-    size_t total_vram = 0;
-    size_t available_ram = 0;
+    csv_file.close();
+    LOG_INF("%s: loaded %zu model statistics entries from %s\n", __func__, entries.size(), csv_path);
+    return true;
+}
 
-    // Use rounding to avoid floating point precision issues
-    size_t model_size_cpu = (size_t)(get_model_size_from_loader(cpu_ml) * 1024 * 1024 * 1024 + 0.5);
-    size_t model_size_gpu = (size_t)(get_model_size_from_loader(gpu_ml) * 1024 * 1024 * 1024 + 0.5);
+// ============================================================
+// Tensor Variance and Weight MinMax Loading
+// ============================================================
 
-    // Calculate layer sizes with proper rounding
-    size_t layer_size_cpu = (model_size_cpu + n_layers - 1) / n_layers;  // Ceiling division
-    size_t layer_size_gpu = (model_size_gpu + n_layers - 1) / n_layers;  // Ceiling division
-
-    LOG_INF("%s: CPU layer size = %.2f MiB\n", 
-                  __func__, layer_size_cpu / (double)MiB);
-    LOG_INF("%s: GPU layer size = %.2f MiB\n", 
-                  __func__, layer_size_gpu / (double)MiB);
-    
-    // Get actual GPU memory info
-#if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA)
-    ggml_backend_dev_props gpu_props;
-    try {
-        device_get_props(model, 0, &gpu_props);
-        // Use actual device memory instead of buffer size
-        available_vram = gpu_props.memory_free;
-        total_vram = gpu_props.memory_total;
-    } catch (...) {
-        LOG_WRN("Failed to get GPU memory info, falling back to CPU-only mode\n");
-        available_vram = 0;
-        total_vram = 0;
-    }
-#endif
-
-    // Get actual CPU memory info
-    available_ram = device_host_physical_memory(true);
-
-    size_t kv_cache_per_layer = 0;
-    if (model && llama_n_ctx_train(model) > 0) {
-        // per layer KV cache = 2 * n_ctx * n_embd * sizeof(float16) / n_layers
-        size_t n_ctx = params->n_ctx ? params->n_ctx : llama_n_ctx_train(model);
-        size_t n_embd = llama_n_embd(model);
-        // Use safe division to avoid floating point issues
-        kv_cache_per_layer = n_layers > 0 ? (2 * n_ctx * n_embd * 2 + n_layers - 1) / n_layers : 0;  // 2 bytes per fp16
-        
-        LOG_INF("%s: KV cache per layer = %.2f MiB\n", 
-                      __func__, kv_cache_per_layer / (double)MiB);
+bool load_tensor_variance_from_csv(
+    const char* csv_path,
+    std::unordered_map<std::string, tensor_variance_entry>& variance_map
+) {
+    std::ifstream csv_file(csv_path);
+    if (!csv_file.is_open()) {
+        LOG_ERR("%s: failed to open CSV file: %s\n", __func__, csv_path);
+        return false;
     }
 
-    int32_t gpu_layers = 0;
-    int32_t cpu_layers = 0;
+    std::string line;
+    // Skip header
+    std::getline(csv_file, line);
 
-    size_t vram_budget = (size_t)(available_vram);
-    size_t ram_budget  = (size_t)(available_ram);
+    int line_num = 1;
+    while (std::getline(csv_file, line)) {
+        line_num++;
+        std::istringstream ss(line);
+        std::string token;
+        tensor_variance_entry entry;
 
-    // Total memory per layer (weights + KV cache)
-    size_t gpu_layer_total = layer_size_gpu + kv_cache_per_layer;
-    size_t cpu_layer_total = layer_size_cpu + kv_cache_per_layer;
+        try {
+            // Parse layer_name
+            if (!std::getline(ss, token, ',')) {
+                LOG_WRN("%s: line %d: missing layer_name\n", __func__, line_num);
+                continue;
+            }
+            entry.tensor_name = token;
 
-    // Maximize GPU layers within VRAM budget - ensure integer division
-    if (gpu_layer_total == 0) {
-        gpu_layers = 0;
-    } else {
-        gpu_layers = (int32_t)std::min((size_t)n_layers, vram_budget / gpu_layer_total);
-    }
-    cpu_layers = (int32_t)n_layers - gpu_layers;
+            // Parse samples
+            if (!std::getline(ss, token, ',')) {
+                LOG_WRN("%s: line %d: missing samples for %s\n",
+                        __func__, line_num, entry.tensor_name.c_str());
+                continue;
+            }
+            entry.samples = std::stoi(token);
 
-    // Use safe multiplication to avoid integer overflow
-    size_t vram_used = (gpu_layer_total > 0 && gpu_layers > 0) ?
-                       (size_t)gpu_layers * gpu_layer_total : 0;
-    size_t ram_used  = (cpu_layer_total > 0 && cpu_layers > 0) ?
-                       (size_t)cpu_layers * cpu_layer_total : 0;
+            // Parse variance
+            if (!std::getline(ss, token, ',')) {
+                LOG_WRN("%s: line %d: missing variance for %s\n",
+                        __func__, line_num, entry.tensor_name.c_str());
+                continue;
+            }
+            entry.variance = std::stof(token);
 
-    // If RAM insufficient, move layers from CPU to GPU
-    while (ram_used > ram_budget && cpu_layers > 0) {
-        if (vram_used + gpu_layer_total > vram_budget) {
-            // GPU also out of memory
-            break;
+            variance_map[entry.tensor_name] = entry;
+
+        } catch (const std::exception& e) {
+            LOG_ERR("%s: line %d: parsing error: %s\n",
+                    __func__, line_num, e.what());
+            continue;
         }
-        gpu_layers++;
-        cpu_layers--;
-        // Update memory usage safely
-        vram_used = (gpu_layer_total > 0 && gpu_layers > 0) ?
-                   (size_t)gpu_layers * gpu_layer_total : 0;
-        ram_used  = (cpu_layer_total > 0 && cpu_layers > 0) ?
-                   (size_t)cpu_layers * cpu_layer_total : 0;
     }
 
-    params->n_gpu_layers = gpu_layers;
-    params->n_cpu_layers = cpu_layers;
-    
-    LOG_INF("%s: Final allocation - GPU layers: %d, CPU layers: %d\n", 
-                  __func__, params->n_gpu_layers, params->n_cpu_layers);
+    csv_file.close();
+    LOG_INF("%s: loaded %zu tensor variance entries from %s\n",
+            __func__, variance_map.size(), csv_path);
+    return true;
+}
+
+bool load_weight_minmax_from_csv(
+    const char* csv_path,
+    std::unordered_map<int, std::unordered_map<std::string,
+        std::unordered_map<int, weight_minmax_entry>>>& minmax_map,
+    int32_t& n_layers
+) {
+    std::ifstream csv_file(csv_path);
+    if (!csv_file.is_open()) {
+        LOG_ERR("%s: failed to open CSV file: %s\n", __func__, csv_path);
+        return false;
+    }
+
+    std::string line;
+    // Skip header
+    std::getline(csv_file, line);
+
+    int line_num = 1;
+    int max_layer_idx = -1;
+
+    while (std::getline(csv_file, line)) {
+        line_num++;
+        std::istringstream ss(line);
+        std::string token;
+        weight_minmax_entry entry;
+
+        try {
+            // Parse tensor_name
+            if (!std::getline(ss, token, ',')) {
+                LOG_WRN("%s: line %d: missing tensor_name\n", __func__, line_num);
+                continue;
+            }
+            entry.weight_name = token;
+
+            // Extract layer index from tensor name: blk.{layer_idx}.{operation}.weight
+            int layer_idx = -1;
+            size_t blk_pos = entry.weight_name.find("blk.");
+            if (blk_pos != std::string::npos) {
+                size_t dot_pos = entry.weight_name.find('.', blk_pos + 4);
+                if (dot_pos != std::string::npos) {
+                    std::string layer_str = entry.weight_name.substr(
+                        blk_pos + 4, dot_pos - blk_pos - 4);
+                    try {
+                        layer_idx = std::stoi(layer_str);
+                        if (layer_idx > max_layer_idx) {
+                            max_layer_idx = layer_idx;
+                        }
+                    } catch (...) {
+                        // Not a layer weight (e.g., token_embd, output)
+                    }
+                }
+            }
+
+            // Parse bit_width
+            if (!std::getline(ss, token, ',')) continue;
+            entry.bit_width = std::stoi(token);
+
+            // Parse elements
+            if (!std::getline(ss, token, ',')) continue;
+            entry.elements = std::stoll(token);
+
+            // Parse min, max, range, scale
+            if (!std::getline(ss, token, ',')) continue;
+            entry.min_val = std::stof(token);
+
+            if (!std::getline(ss, token, ',')) continue;
+            entry.max_val = std::stof(token);
+
+            if (!std::getline(ss, token, ',')) continue;
+            entry.range = std::stof(token);
+
+            if (!std::getline(ss, token, ',')) continue;
+            entry.scale = std::stof(token);  // Read scale
+
+            // Parse type (not used but need to consume)
+            if (!std::getline(ss, token, ',')) continue;
+            // entry.type = token;
+
+            // Store in map (only for layer weights)
+            if (layer_idx >= 0) {
+                minmax_map[layer_idx][entry.weight_name][entry.bit_width] = entry;
+            }
+
+        } catch (const std::exception& e) {
+            LOG_ERR("%s: line %d: parsing error: %s\n",
+                    __func__, line_num, e.what());
+            continue;
+        }
+    }
+
+    csv_file.close();
+    n_layers = max_layer_idx + 1;
+    LOG_INF("%s: loaded minmax data for %d layers from %s\n",
+            __func__, n_layers, csv_path);
+    return true;
+}
+
+// ============================================================
+// Layer Sensitivity Calculation Implementation
+// ============================================================
+
+float bitwidth_model_params::get_input_variance(int layer_idx, const std::string& input_name) const {
+    char tensor_name[128];
+    snprintf(tensor_name, sizeof(tensor_name), "blk.%d.%s", layer_idx, input_name.c_str());
+
+    auto it = tensor_variance_map.find(tensor_name);
+    if (it != tensor_variance_map.end()) {
+        return it->second.variance;
+    }
+
+    // fail on missing data
+    GGML_ASSERT(false && "Missing input variance data - ensure tensor_capture_stats.csv contains all required tensors");
+    return 0.0f;  // unreachable
+}
+
+std::pair<int64_t, float> bitwidth_model_params::get_weight_minmax_scale(
+    int layer_idx, const std::string& weight_name, int bitwidth) const {
+
+    auto layer_it = weight_minmax_map.find(layer_idx);
+    GGML_ASSERT(layer_it != weight_minmax_map.end() && "Missing minmax data for layer");
+
+    // Build full weight name: blk.{layer_idx}.{weight_name}
+    // weight_name can be "attn_q.weight" (short) or "blk.0.attn_q.weight" (full)
+    std::string full_weight_name = weight_name;
+    if (weight_name.find("blk.") != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "blk.%d.%s", layer_idx, weight_name.c_str());
+        full_weight_name = buf;
+    }
+
+    auto weight_it = layer_it->second.find(full_weight_name);
+    GGML_ASSERT(weight_it != layer_it->second.end() && "Missing minmax data for weight");
+
+    // exact bitwidth match only
+    auto bw_it = weight_it->second.find(bitwidth);
+    GGML_ASSERT(bw_it != weight_it->second.end() && "Missing minmax data for bitwidth - ensure tensor_minmax_stats_all.csv contains all bitwidths");
+
+    // Use scale value directly from CSV
+    return {bw_it->second.elements, bw_it->second.scale};
+}
+
+float bitwidth_model_params::calculate_layer_sensitivity(int layer_idx, int bitwidth) const {
+    float total_sensitivity = 0.0f;
+
+    // Define operations: each weight and its input
+    struct OpInfo { const char* weight_name; const char* input_name; };
+    std::vector<OpInfo> operations = {
+        {"attn_q.weight", "attn_q.in"},
+        {"attn_k.weight", "attn_q.in"},     // Shares input
+        {"attn_v.weight", "attn_q.in"},     // Shares input
+        {"attn_output.weight", "attn_output.in"},
+        {"ffn_gate.weight", "ffn_up.in"},   // Shares input
+        {"ffn_up.weight", "ffn_up.in"},
+        {"ffn_down.weight", "ffn_down.in"}
+    };
+
+    // Group by input to handle sharing correctly
+    std::unordered_map<std::string, std::vector<const char*>> input_to_weights;
+    for (const auto& op : operations) {
+        input_to_weights[op.input_name].push_back(op.weight_name);
+    }
+
+    // Calculate contribution for each unique input
+    for (const auto& [input_name, weight_names] : input_to_weights) {
+        float input_var = get_input_variance(layer_idx, input_name);
+        float G_X = input_var / 4.0f;  // G(X) = Var[X] / 4
+
+        if (G_X <= 0.0f) continue;
+
+        float input_contribution = 0.0f;
+        for (const char* weight_name : weight_names) {
+            // get_weight_minmax_scale validates data with GGML_ASSERT internally
+            auto [elements, S_W] = get_weight_minmax_scale(layer_idx, weight_name, bitwidth);
+
+            // Contribution: D_W * (S_W)^2 * G(X)
+            float contribution = static_cast<float>(elements) * S_W * S_W * G_X;
+            input_contribution += contribution;
+        }
+        total_sensitivity += input_contribution;
+    }
+
+    return total_sensitivity;
+}
+
+bool bitwidth_model_params::load_sensitivity_data(
+    const char* variance_csv_path, const char* minmax_csv_path) {
+
+    LOG_INF("%s: loading sensitivity data...\n", __func__);
+
+    // Load variance data
+    if (!load_tensor_variance_from_csv(variance_csv_path, tensor_variance_map)) {
+        LOG_ERR("%s: failed to load variance data from %s\n",
+                __func__, variance_csv_path);
+        return false;
+    }
+
+    // Load minmax data
+    if (!load_weight_minmax_from_csv(minmax_csv_path, weight_minmax_map, n_layers)) {
+        LOG_ERR("%s: failed to load minmax data from %s\n",
+                __func__, minmax_csv_path);
+        return false;
+    }
+
+    // Clear cache
+    sensitivity_cache.clear();
+
+    // Mark as loaded
+    sensitivity_data_loaded = true;
+
+    LOG_INF("%s: successfully loaded sensitivity data for %d layers\n", __func__, n_layers);
+    LOG_INF("%s: %zu variance entries, %zu layers with minmax data\n",
+            __func__, tensor_variance_map.size(), weight_minmax_map.size());
+
+    return true;
+}
+
+void bitwidth_model_params::clear_sensitivity_data() {
+    tensor_variance_map.clear();
+    weight_minmax_map.clear();
+    sensitivity_cache.clear();
+    sensitivity_data_loaded = false;
+    n_layers = 0;
+
+    LOG_INF("%s: sensitivity data cleared - must load data before calling get_quality_loss()\n", __func__);
+}
+
+bool bitwidth_model_params::load_sensitivity_cache_from_csv(const char* cache_csv_path) {
+    LOG_INF("%s: loading pre-computed sensitivity cache from %s...\n", __func__, cache_csv_path);
+
+    std::ifstream csv_file(cache_csv_path);
+    if (!csv_file.is_open()) {
+        LOG_ERR("%s: failed to open cache CSV file: %s\n", __func__, cache_csv_path);
+        return false;
+    }
+
+    std::string line;
+    // Skip header
+    std::getline(csv_file, line);
+
+    int line_num = 1;
+    int max_layer_idx = -1;
+
+    // Clear existing cache
+    sensitivity_cache.clear();
+
+    while (std::getline(csv_file, line)) {
+        line_num++;
+        std::istringstream ss(line);
+        std::string token;
+
+        try {
+            // Parse layer_idx
+            if (!std::getline(ss, token, ',')) {
+                LOG_WRN("%s: line %d: missing layer_idx\n", __func__, line_num);
+                continue;
+            }
+            int layer_idx = std::stoi(token);
+            if (layer_idx > max_layer_idx) {
+                max_layer_idx = layer_idx;
+            }
+
+            // Parse bitwidth
+            if (!std::getline(ss, token, ',')) {
+                LOG_WRN("%s: line %d: missing bitwidth\n", __func__, line_num);
+                continue;
+            }
+            int bitwidth = std::stoi(token);
+
+            // Parse sensitivity
+            if (!std::getline(ss, token, ',')) {
+                LOG_WRN("%s: line %d: missing sensitivity value\n", __func__, line_num);
+                continue;
+            }
+            float sensitivity = std::stof(token);
+
+            // Store in cache
+            sensitivity_cache[layer_idx][bitwidth] = sensitivity;
+
+        } catch (const std::exception& e) {
+            LOG_WRN("%s: line %d: parse error: %s\n", __func__, line_num, e.what());
+            continue;
+        }
+    }
+
+    if (sensitivity_cache.empty()) {
+        LOG_ERR("%s: no valid data found in cache CSV file\n", __func__);
+        return false;
+    }
+
+    // Set n_layers based on max layer index found
+    n_layers = max_layer_idx + 1;
+
+    // Mark as loaded (even though we only loaded cache, not raw data)
+    sensitivity_data_loaded = true;
+
+    LOG_INF("%s: successfully loaded sensitivity cache for %d layers\n", __func__, n_layers);
+    LOG_INF("%s: %zu cache entries loaded\n", __func__, sensitivity_cache.size());
+
+    return true;
+}
+
+float bitwidth_model_params::get_quality_loss(int layer_idx, int bitwidth) const {
+    // sensitivity data must be loaded first
+    GGML_ASSERT(sensitivity_data_loaded && "Sensitivity data not loaded - call load_sensitivity_data() first");
+
+    // Check cache - log on hit
+    auto layer_it = sensitivity_cache.find(layer_idx);
+    if (layer_it != sensitivity_cache.end()) {
+        auto bw_it = layer_it->second.find(bitwidth);
+        if (bw_it != layer_it->second.end()) {
+            LOG_INF("%s: using CACHED sensitivity for layer %d, bitwidth %d: %f\n",
+                    __func__, layer_idx, bitwidth, bw_it->second);
+            return bw_it->second;
+        }
+    }
+
+    // Validate inputs
+    GGML_ASSERT(layer_idx >= 0 && layer_idx < n_layers && "Invalid layer_idx");
+    GGML_ASSERT(bitwidth > 0 && bitwidth <= 16 && "Invalid bitwidth");
+
+    // Calculate sensitivity
+    float sensitivity = calculate_layer_sensitivity(layer_idx, bitwidth);
+
+    // Cache result
+    sensitivity_cache[layer_idx][bitwidth] = sensitivity;
+
+    LOG_INF("%s: calculated sensitivity for layer %d, bitwidth %d: %f\n",
+            __func__, layer_idx, bitwidth, sensitivity);
+
+    return sensitivity;
 }

@@ -22,6 +22,7 @@ struct cpu_props {
     float        flops_q5k_f32;     // in GFLOPS
     float        flops_q6k_f32;     // in GFLOPS
     float        flops_iq2xxs_f32;  // in GFLOPS
+    float        flops_iq2xs_f32;   // in GFLOPS
     float        flops_q50_f32;     // in GFLOPS    
     float        flops_q80_f32;     // in GFLOPS
     float        flops_iq1s_f32;    // in GFLOPS
@@ -39,6 +40,7 @@ struct cpu_props {
           flops_q5k_f32   (0.0f),
           flops_q6k_f32   (0.0f),
           flops_iq2xxs_f32(0.0f),
+          flops_iq2xs_f32 (0.0f),
           flops_q50_f32   (0.0f),
           flops_q80_f32   (0.0f),
           flops_iq1s_f32  (0.0f), 
@@ -98,6 +100,7 @@ struct gpu_props {
     float        metal_flops_q5k_f32;     // in GFLOPS
     float        metal_flops_q6k_f32;     // in GFLOPS
     float        metal_flops_iq2xxs_f32;  // in GFLOPS
+    float        metal_flops_iq2xs_f32;   // in GFLOPS
     float        metal_flops_q50_f32;     // in GFLOPS
     float        metal_flops_q80_f32;     // in GFLOPS
     float        metal_flops_iq1s_f32;    // in GFLOPS
@@ -112,12 +115,14 @@ struct gpu_props {
     float        cuda_flops_q5k_f32;      // in GFLOPS
     float        cuda_flops_q6k_f32;      // in GFLOPS
     float        cuda_flops_iq2xxs_f32;   // in GFLOPS
+    float        cuda_flops_iq2xs_f32;    // in GFLOPS
     float        cuda_flops_q50_f32;      // in GFLOPS
     float        cuda_flops_q80_f32;      // in GFLOPS
     float        cuda_flops_iq1s_f32;     // in GFLOPS
     float        cuda_flops_iq4nl_f32;    // in GFLOPS
     float        cuda_flops_iq1m_f32;     // in GFLOPS
     float        cuda_mem_cpy_delay;      // in ms
+    float        cuda_pcie_bw;            // in GB/s (measured CPU<->GPU transfer bandwidth)
 
     gpu_props() : 
         name                    (""), 
@@ -132,6 +137,7 @@ struct gpu_props {
         metal_flops_q5k_f32     (0.0f),
         metal_flops_q6k_f32     (0.0f),
         metal_flops_iq2xxs_f32  (0.0f),
+        metal_flops_iq2xs_f32   (0.0f),
         metal_flops_q50_f32     (0.0f),
         metal_flops_q80_f32     (0.0f),
         metal_flops_iq1s_f32    (0.0f),
@@ -146,12 +152,14 @@ struct gpu_props {
         cuda_flops_q5k_f32      (0.0f),
         cuda_flops_q6k_f32      (0.0f),
         cuda_flops_iq2xxs_f32   (0.0f),
+        cuda_flops_iq2xs_f32    (0.0f),
         cuda_flops_q50_f32      (0.0f),
         cuda_flops_q80_f32      (0.0f),
         cuda_flops_iq1s_f32     (0.0f),
         cuda_flops_iq4nl_f32    (0.0f),
         cuda_flops_iq1m_f32     (0.0f),
-        cuda_mem_cpy_delay      (0.0f) {}
+        cuda_mem_cpy_delay      (0.0f),
+        cuda_pcie_bw            (0.0f) {}
 };
 
 struct model_flops {
@@ -163,6 +171,7 @@ struct model_flops {
     int64_t output_q5k_f32;
     int64_t output_q6k_f32;
     int64_t output_iq2xxs_f32;
+    int64_t output_iq2xs_f32;
     int64_t output_q50_f32;
     int64_t output_q80_f32;
     int64_t output_iq1s_f32;
@@ -175,6 +184,7 @@ struct model_flops {
     int64_t layer_q5k_f32;
     int64_t layer_q6k_f32;
     int64_t layer_iq2xxs_f32;
+    int64_t layer_iq2xs_f32;
     int64_t layer_q50_f32;
     int64_t layer_q80_f32;
     int64_t layer_iq1s_f32;
@@ -190,6 +200,7 @@ struct model_flops {
         output_q5k_f32     (0),
         output_q6k_f32     (0), 
         output_iq2xxs_f32  (0),
+        output_iq2xs_f32   (0),
         output_q50_f32     (0),
         output_q80_f32     (0),
         output_iq1s_f32    (0),
@@ -202,6 +213,7 @@ struct model_flops {
         layer_q5k_f32      (0),
         layer_q6k_f32      (0),
         layer_iq2xxs_f32   (0),
+        layer_iq2xs_f32    (0),
         layer_q50_f32      (0),
         layer_q80_f32      (0),
         layer_iq1s_f32     (0),
@@ -218,6 +230,7 @@ struct model_params {
     int64_t input_q5k;
     int64_t input_q6k;
     int64_t input_iq2xxs;
+    int64_t input_iq2xs;
     int64_t input_q50;
     int64_t input_q80;
     int64_t input_iq1s;
@@ -230,6 +243,7 @@ struct model_params {
     int64_t output_q5k;
     int64_t output_q6k;
     int64_t output_iq2xxs;
+    int64_t output_iq2xs;
     int64_t output_q50;
     int64_t output_q80;
     int64_t output_iq1s;
@@ -242,6 +256,7 @@ struct model_params {
     int64_t layer_q5k;
     int64_t layer_q6k;
     int64_t layer_iq2xxs;
+    int64_t layer_iq2xs;
     int64_t layer_q50;
     int64_t layer_q80;
     int64_t layer_iq1s;
@@ -256,6 +271,7 @@ struct model_params {
         input_q5k       (0),
         input_q6k       (0),
         input_iq2xxs    (0),
+        input_iq2xs     (0),
         input_q50       (0),
         input_q80       (0),
         input_iq1s      (0),
@@ -268,6 +284,7 @@ struct model_params {
         output_q5k      (0),
         output_q6k      (0),
         output_iq2xxs   (0),
+        output_iq2xs    (0),
         output_q50      (0),
         output_q80      (0),
         output_iq1s     (0),
@@ -280,6 +297,7 @@ struct model_params {
         layer_q5k       (0),
         layer_q6k       (0),
         layer_iq2xxs    (0),
+        layer_iq2xs     (0),
         layer_q50       (0),
         layer_q80       (0),
         layer_iq1s      (0),
@@ -331,6 +349,9 @@ struct startup_args{
     uint32_t n_ctx;
 };
 
+// Forward declaration for model_statistics_entry
+struct model_statistics_entry;
+
 struct device_info {
     uint32_t            rank;
     const char *        device_name;
@@ -344,6 +365,8 @@ struct device_info {
     struct model_flops  model_flops;
     struct model_params model_params;
     struct model_bytes  model_bytes;
+
+    std::vector<model_statistics_entry> model_stats_all;
 
     device_info() : 
         rank(0), 
@@ -403,11 +426,12 @@ float    device_metal_mem_copy    (struct llama_model * model);
 float    device_cuda_mem_copy     (struct llama_model * model);
 float    device_metal_read_vram_bw();
 float    device_cuda_read_vram_bw ();
+float    device_cuda_pcie_bw      (); // Measure CPU<->GPU PCIe bandwidth (Linux only)
 void     device_get_props         (struct llama_model * model, int device, struct ggml_backend_dev_props * props); 
-void     device_print_props       (struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams);
+void     device_print_props       (struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams, bool ada_quant = false);
+void     device_export_csv        (const struct device_info * dev_info_set, int n, struct llama_model * model, const char * output_path);
 
-void     mixed_precision_layer_allocation(struct gpt_params * params, struct llama_model * model, uint32_t n_layers,
-                                         struct llama_model_loader * cpu_ml = nullptr, struct llama_model_loader * gpu_ml = nullptr);
+uint64_t device_host_physical_memory(bool available);
 
 int      device_has_metal  (void);
 int      device_has_cuda   (void);
@@ -419,5 +443,319 @@ int      device_has_sycl   (void);
 
 size_t   serialize  (const struct device_info * dev_info, char ** buffer);
 size_t   deserialize(const char * buffer, struct device_info * dev_info);
+struct model_statistics_entry {
+    std::string model_id;       // e.g., "llama_1", "llama_2", "llama_4", "llama_8", "llama_16"
+    struct model_flops flops;   // FLOPS for each quantization type
+    struct model_params params;  // Parameter counts for each quantization type
+    struct model_bytes bytes;    // Byte sizes for input/layer/output
+
+    model_statistics_entry() : model_id(""), flops(), params(), bytes() {}
+};
+
+// Tensor activation variance statistics captured during inference
+// Uses Welford's online algorithm for O(1) memory variance computation
+struct tensor_variance_entry {
+    std::string tensor_name;   // e.g., "blk.0.attn_q.in"
+    int32_t     samples;       // Number of samples captured
+    float       variance;      // Variance of the tensor activation
+
+    tensor_variance_entry() : tensor_name(""), samples(0), variance(0.0f) {}
+};
+
+// Weight min-max statistics for quantization sensitivity calculation
+// CSV scale column contains pre-computed scaling factor S_W(b) for each bitwidth
+struct weight_minmax_entry {
+    std::string weight_name;    // e.g., "blk.0.attn_q.weight"
+    int32_t     bit_width;      // 1, 2, 4, 8, 16
+    int64_t     elements;       // Number of parameters D_W
+    float       min_val;        // Minimum weight value
+    float       max_val;        // Maximum weight value
+    float       range;          // max - min
+    float       scale;          // CSV pre-computed scaling factor S_W(bit_width)
+
+    weight_minmax_entry()
+        : weight_name(""), bit_width(0), elements(0),
+          min_val(0.0f), max_val(0.0f), range(0.0f), scale(0.0f) {}
+
+    // Get scaling factor - directly use CSV scale value
+    float get_scaling_factor() const {
+        return scale;
+    }
+
+    // When falling back to other bitwidth, recompute scaling factor from range
+    float get_scaling_factor_from_range(int target_bitwidth) const {
+        if (target_bitwidth <= 0 || target_bitwidth > 16) return 0.0f;
+        float denominator = static_cast<float>((1LL << target_bitwidth) - 1);
+        return (denominator > 0.0f) ? (range / denominator) : 0.0f;
+    }
+};
+
+// Load model statistics from CSV file
+// Returns true on success, false on failure
+bool load_model_statistics_from_csv(
+    const char * csv_path,
+    std::vector<model_statistics_entry>& entries
+);
+
+// Load tensor variance statistics from tensor_capture_stats.csv
+// Format: layer_name,samples,variance
+bool load_tensor_variance_from_csv(
+    const char* csv_path,
+    std::unordered_map<std::string, tensor_variance_entry>& variance_map
+);
+
+// Load weight minmax statistics from tensor_minmax_stats_all.csv
+// Format: tensor_name,bit_width,elements,min,max,range,scale,type
+bool load_weight_minmax_from_csv(
+    const char* csv_path,
+    std::unordered_map<int, std::unordered_map<std::string,
+        std::unordered_map<int, weight_minmax_entry>>>& minmax_map,
+    int32_t& n_layers
+);
+
+// Internal FLOPS measurement function with n_embd override support
+// Allows profiling without loading a model (pass model=nullptr and n_embd_override=4096)
+float device_flops_internal(
+    struct llama_model * model,
+    enum ggml_type src0t,
+    enum ggml_type src1t,
+    enum profiler_backend_type btype,
+    int n_threads,
+    int n_embd_override);
+
+// ============================================================
+// Adaptive Bitwidth Allocation Structures
+// ============================================================
+
+// Mapping from nominal bitwidth to ggml_type and model metadata
+// LaTeX: b in B -> (ggml_type, model_suffix, quality_loss)
+struct bitwidth_entry {
+    int nominal_bitwidth;       // 1, 2, 4, 8, 16
+    enum ggml_type weight_type; // GGML_TYPE_IQ1_S, GGML_TYPE_Q2_K, etc.
+    const char* model_suffix;   // "_Q4_K_M", "_Q8_0", "_F16", etc.
+
+    // Per-parameter statistics (computed from model metadata)
+    float quality_loss;         // Delta Q for this bitwidth (Fisher-weighted outlier)
+
+    // Actual model statistics loaded from CSV
+    // Pointer to the full model statistics entry for this bitwidth
+    // MUST NOT be nullptr - CSV data is required
+    const model_statistics_entry* model_stats;
+
+    bitwidth_entry()
+        : nominal_bitwidth(0), weight_type(GGML_TYPE_F32), model_suffix(""),
+          quality_loss(0.0f), model_stats(nullptr) {}
+
+    bitwidth_entry(int bw, enum ggml_type wt, const char* suffix,
+                   float qloss, const model_statistics_entry* stats)
+        : nominal_bitwidth(bw), weight_type(wt), model_suffix(suffix),
+          quality_loss(qloss), model_stats(stats) {}
+};
+
+// Container for bitwidth lookup table
+// Provides mapping: bitwidth -> (layer_bytes, layer_flops, quality_loss)
+struct bitwidth_model_params {
+    std::unordered_map<int, bitwidth_entry> entries;
+
+    // Default constructor - creates empty entries
+    // Must use the CSV constructor to populate with actual model statistics
+    bitwidth_model_params() {
+        // Entries remain empty - CSV data is required for proper operation
+    }
+
+    // Constructor with model statistics from CSV
+    // Parses model_stats_all to extract bitwidth-specific data
+    bitwidth_model_params(const std::vector<model_statistics_entry>& model_stats_all) {
+        // Helper function to extract bitwidth from model_id (e.g., "llama_1" -> 1)
+        auto extract_bitwidth = [](const std::string& model_id) -> int {
+            size_t underscore_pos = model_id.find('_');
+            if (underscore_pos != std::string::npos) {
+                std::string bw_str = model_id.substr(underscore_pos + 1);
+                try {
+                    return std::stoi(bw_str);
+                } catch (...) {
+                    return 0;
+                }
+            }
+            return 0;
+        };
+
+        // Build bitwidth to model statistics mapping
+        std::unordered_map<int, const model_statistics_entry*> bw_to_stats;
+        for (const auto& entry : model_stats_all) {
+            int bw = extract_bitwidth(entry.model_id);
+            if (bw > 0) {
+                bw_to_stats[bw] = &entry;
+            }
+        }
+
+        // Initialize entries with actual CSV data
+        // Map bitwidth to ggml_type and use CSV statistics
+        entries[1]  = bitwidth_entry(1,  GGML_TYPE_IQ1_S,   "_IQ1_S",   2.0f,
+                                    bw_to_stats.count(1)  ? bw_to_stats[1]  : nullptr);
+        entries[2]  = bitwidth_entry(2,  GGML_TYPE_Q2_K,     "_Q2_K",     1.0f,
+                                    bw_to_stats.count(2)  ? bw_to_stats[2]  : nullptr);
+        entries[4]  = bitwidth_entry(4,  GGML_TYPE_Q4_K,     "_Q4_K_M",   0.3f,
+                                    bw_to_stats.count(4)  ? bw_to_stats[4]  : nullptr);
+        entries[8]  = bitwidth_entry(8,  GGML_TYPE_Q8_0,     "_Q8_0",     0.1f,
+                                    bw_to_stats.count(8)  ? bw_to_stats[8]  : nullptr);
+        entries[16] = bitwidth_entry(16, GGML_TYPE_F16,      "_F16",      0.0f,
+                                    bw_to_stats.count(16) ? bw_to_stats[16] : nullptr);
+    }
+
+    const bitwidth_entry* get_entry(int bitwidth) const {
+        auto it = entries.find(bitwidth);
+        return (it != entries.end()) ? &(it->second) : nullptr;
+    }
+
+    enum ggml_type get_weight_type(int bitwidth) const {
+        const bitwidth_entry* e = get_entry(bitwidth);
+        return e ? e->weight_type : GGML_TYPE_F32;
+    }
+
+    // LaTeX: beta_{i,b} - per-layer bytes at given bitwidth
+    // CSV data is required - will assert if not available
+    int64_t get_layer_bytes(int layer_idx, int bitwidth, const struct model_bytes& base) const {
+        const bitwidth_entry* e = get_entry(bitwidth);
+        GGML_ASSERT(e != nullptr && "Bitwidth entry not found - CSV data required");
+        GGML_ASSERT(e->model_stats != nullptr && "Model statistics (CSV data) required - cannot proceed without it");
+        return e->model_stats->bytes.nb_layer;
+    }
+
+    // LaTeX: f_{i,b} - per-layer FLOPs at given bitwidth
+    // Returns the complete model_flops structure containing FLOPs for all operation types
+    // This allows the caller to compute execution time by matching each operation type
+    // with the corresponding device performance (e.g., layer_q4k_f32 / cpu.flops_q4k_f32)
+    const struct model_flops& get_layer_flops(int layer_idx, int bitwidth, const struct model_flops& base) const {
+        const bitwidth_entry* e = get_entry(bitwidth);
+        // If CSV data is available, return the complete FLOPs structure
+        // containing all operation types (F32, F16, Q2K, Q4K, etc.)
+        if (e && e->model_stats != nullptr) {
+            return e->model_stats->flops;
+        }
+        // Fallback to base FLOPs structure
+        return base;
+    }
+
+    // LaTeX: Delta Q_{i,b} - quality loss at given bitwidth
+    // Uses calculated layer sensitivity or falls back to hardcoded values
+    float get_quality_loss(int layer_idx, int bitwidth) const;
+
+    // Load sensitivity data from CSV files
+    // Call this before using get_quality_loss() with layer_idx for accurate results
+    bool load_sensitivity_data(const char* variance_csv_path, const char* minmax_csv_path);
+
+    // Load pre-computed sensitivity cache from CSV file
+    // CSV format: layer_idx,bitwidth,sensitivity
+    bool load_sensitivity_cache_from_csv(const char* cache_csv_path);
+
+    // Check if sensitivity data has been loaded
+    bool has_sensitivity_data() const { return sensitivity_data_loaded; }
+
+    // Clear loaded sensitivity data and reset to hardcoded mode
+    void clear_sensitivity_data();
+
+private:
+    // Tensor variance statistics: tensor_name -> variance_entry
+    std::unordered_map<std::string, tensor_variance_entry> tensor_variance_map;
+
+    // Weight minmax statistics: layer_idx -> (weight_name -> (bitwidth -> minmax_entry))
+    std::unordered_map<int, std::unordered_map<std::string,
+        std::unordered_map<int, weight_minmax_entry>>> weight_minmax_map;
+
+    // Sensitivity calculation cache: cache[layer_idx][bitwidth] = sensitivity_value
+    mutable std::unordered_map<int, std::unordered_map<int, float>> sensitivity_cache;
+
+    // Flag indicating if sensitivity data has been loaded
+    bool sensitivity_data_loaded = false;
+
+    // Number of layers in the model
+    int32_t n_layers = 0;
+
+    // Get activation variance for a specific input tensor
+    float get_input_variance(int layer_idx, const std::string& input_name) const;
+
+    // Get weight elements count and scaling factor
+    // Returns: pair<elements_count, scaling_factor>
+    std::pair<int64_t, float> get_weight_minmax_scale(
+        int layer_idx, const std::string& weight_name, int bitwidth) const;
+
+    // Calculate layer sensitivity for a given bitwidth
+    // Formula: omega_{i,b} = sum_{o in O_i} [ D_Wo * (S_Wo(b))^2 * G(Xo) ]
+    float calculate_layer_sensitivity(int layer_idx, int bitwidth) const;
+
+public:
+    // Check if bitwidth is supported
+    bool has_bitwidth(int bitwidth) const {
+        return entries.find(bitwidth) != entries.end();
+    }
+
+    // Check if bitwidth has actual CSV data
+    bool has_csv_data(int bitwidth) const {
+        const bitwidth_entry* e = get_entry(bitwidth);
+        return e && e->model_stats != nullptr;
+    }
+
+    // LaTeX: B_i^b - input layer bytes at bitwidth b
+    // CSV data is required - will assert if not available
+    int64_t get_input_bytes(int bitwidth) const {
+        const bitwidth_entry* e = get_entry(bitwidth);
+        GGML_ASSERT(e != nullptr && "Bitwidth entry not found - CSV data required");
+        GGML_ASSERT(e->model_stats != nullptr && "Model statistics (CSV data) required - cannot proceed without it");
+        return e->model_stats->bytes.nb_input;
+    }
+
+    // LaTeX: B_o^b - output layer bytes at bitwidth b
+    // CSV data is required - will assert if not available
+    int64_t get_output_bytes(int bitwidth) const {
+        const bitwidth_entry* e = get_entry(bitwidth);
+        GGML_ASSERT(e != nullptr && "Bitwidth entry not found - CSV data required");
+        GGML_ASSERT(e->model_stats != nullptr && "Model statistics (CSV data) required - cannot proceed without it");
+        return e->model_stats->bytes.nb_output;
+    }
+};
+
+// 2D allocation result: [device][bitwidth_index] -> layer count
+// Output structure for assign_layers_to_device_adaptive
+struct bitwidth_allocation {
+    // LaTeX: collapsed from z_{i,m,b}^{tau} solution
+    std::vector<std::vector<uint32_t>> n_layer_window;  // [m][b_idx] -> total layers on device m with bitwidth b
+    std::vector<std::vector<uint32_t>> n_gpu_layers;    // [m][b_idx] -> GPU layers on device m with bitwidth b
+    std::vector<int> selected_bitwidth_cpu;   // [m] -> optimal bitwidth for CPU backend
+    std::vector<int> selected_bitwidth_gpu;   // [m] -> optimal bitwidth for GPU backend
+
+    bitwidth_allocation() {}
+
+    bitwidth_allocation(uint32_t n_world, size_t n_bitwidths)
+        : n_layer_window(n_world, std::vector<uint32_t>(n_bitwidths, 0)),
+          n_gpu_layers(n_world, std::vector<uint32_t>(n_bitwidths, 0)),
+          selected_bitwidth_cpu(n_world, 0),
+          selected_bitwidth_gpu(n_world, 0) {}
+
+    void resize(uint32_t n_world, size_t n_bitwidths) {
+        n_layer_window.assign(n_world, std::vector<uint32_t>(n_bitwidths, 0));
+        n_gpu_layers.assign(n_world, std::vector<uint32_t>(n_bitwidths, 0));
+        selected_bitwidth_cpu.assign(n_world, 0);
+        selected_bitwidth_gpu.assign(n_world, 0);
+    }
+
+    // Get total layers assigned to device m (sum over all bitwidths)
+    uint32_t total_layers(uint32_t m) const {
+        uint32_t sum = 0;
+        for (const auto& count : n_layer_window[m]) {
+            sum += count;
+        }
+        return sum;
+    }
+
+    // Get total GPU layers assigned to device m
+    uint32_t total_gpu_layers(uint32_t m) const {
+        uint32_t sum = 0;
+        for (const auto& count : n_gpu_layers[m]) {
+            sum += count;
+        }
+        return sum;
+    }
+};
 
 #endif // PROFILER_H

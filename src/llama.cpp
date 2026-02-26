@@ -3498,8 +3498,8 @@ struct llama_context {
     // sockets
     std::string      master_ip     = "127.0.0.1";
     std::string      next_node_ip  = "127.0.0.1";
-    uint32_t         data_port     = 9000;
-    uint32_t         signal_port   = 10000;
+    uint32_t         data_port     = 9005;
+    uint32_t         signal_port   = 10032;
     zmq::context_t * sock_context  = nullptr;
     zmq::socket_t  * send_socket   = nullptr; 
     zmq::socket_t  * recv_socket   = nullptr; 
@@ -3511,8 +3511,15 @@ struct llama_context {
     // Tensor capture for adaptive quantization
     struct TensorCaptureData {
         std::string name;                           // tensor name
-        std::vector<std::vector<float>> raw_data;   // [sample_idx][element_idx] - all raw data
-        size_t sample_count = 0;                    // total number of samples (tokens)
+
+        // Welford's online algorithm state (O(1) memory instead of storing all raw data)
+        size_t count = 0;                           // total number of elements processed
+        double mean = 0.0;                          // running mean (μ)
+        double M2 = 0.0;                            // sum of squared differences from mean
+
+        // Legacy fields for API compatibility and debugging
+        std::vector<std::vector<float>> raw_data;   // optional: stored only if needed for debugging
+        size_t sample_count = 0;                    // total number of samples (tensor captures)
         double overall_variance = -1.0;             // cached overall variance (computed on demand)
     };
     std::unordered_map<std::string, TensorCaptureData> tensor_capture_map;
@@ -3638,40 +3645,21 @@ static std::vector<float> extract_tensor_data(
     return data;
 }
 
-// Compute overall variance across all collected samples (all tokens, all elements)
-// Uses two-pass algorithm: pass 1 for mean, pass 2 for variance
+// Compute overall variance using Welford's online algorithm state
+// Returns variance = M2 / count (O(1) computation)
 static double compute_overall_variance(const llama_context::TensorCaptureData & data) {
-    if (data.raw_data.empty()) return 0.0;
-
     // Return cached value if available
     if (data.overall_variance >= 0.0) {
         return data.overall_variance;
     }
 
-    // Pass 1: compute mean across all elements
-    double mean = 0.0;
-    size_t total_count = 0;
-
-    for (const auto & sample : data.raw_data) {
-        for (float val : sample) {
-            mean += static_cast<double>(val);
-            total_count++;
-        }
+    // No data processed yet
+    if (data.count == 0) {
+        return 0.0;
     }
 
-    if (total_count == 0) return 0.0;
-    mean /= total_count;
-
-    // Pass 2: compute variance
-    double variance = 0.0;
-    for (const auto & sample : data.raw_data) {
-        for (float val : sample) {
-            double diff = static_cast<double>(val) - mean;
-            variance += diff * diff;
-        }
-    }
-
-    variance /= total_count;
+    // Compute variance from Welford state: variance = M2 / count
+    double variance = data.M2 / data.count;
 
     // Cache the result (const_cast is safe here as we're caching a computed value)
     const_cast<llama_context::TensorCaptureData &>(data).overall_variance = variance;
@@ -3710,26 +3698,51 @@ static bool tensor_capture_callback(struct ggml_tensor * t, bool ask, void * use
 
     std::string tensor_name(t->name);
 
-    // Store raw data
+    // Store/update data using Welford's online algorithm
     auto it = cb_data->lctx->tensor_capture_map.find(tensor_name);
     if (it == cb_data->lctx->tensor_capture_map.end()) {
         // Create new entry
         llama_context::TensorCaptureData data;
         data.name = tensor_name;
-        data.raw_data.push_back(std::move(tensor_data));
         data.sample_count = 1;
+
+        // Initialize Welford state with first batch of data
+        for (float val : tensor_data) {
+            data.count++;
+            double delta = static_cast<double>(val) - data.mean;
+            data.mean += delta / data.count;
+            double delta2 = static_cast<double>(val) - data.mean;
+            data.M2 += delta * delta2;
+        }
+
+        // Optionally keep raw data for debugging
+        data.raw_data.push_back(std::move(tensor_data));
+
         cb_data->lctx->tensor_capture_map[tensor_name] = data;
     } else {
         // Update existing entry
-        it->second.raw_data.push_back(std::move(tensor_data));
-        it->second.sample_count++;
-        it->second.overall_variance = -1.0;  // Reset cached variance
+        auto & entry = it->second;
+        entry.sample_count++;
+        entry.overall_variance = -1.0;  // Reset cached variance
+
+        // Update Welford state incrementally for each element
+        for (float val : tensor_data) {
+            entry.count++;
+            double delta = static_cast<double>(val) - entry.mean;
+            entry.mean += delta / entry.count;
+            double delta2 = static_cast<double>(val) - entry.mean;
+            entry.M2 += delta * delta2;
+        }
+
+        // Optionally keep raw data for debugging
+        entry.raw_data.push_back(std::move(tensor_data));
     }
 
-    LLAMA_LOG_DEBUG("%s: captured tensor '%s', elements: %zu, samples: %zu\n",
+    LLAMA_LOG_DEBUG("%s: captured tensor '%s', elements: %zu, samples: %zu, total_count: %zu\n",
                    __func__, tensor_name.c_str(),
                    cb_data->lctx->tensor_capture_map[tensor_name].raw_data.back().size(),
-                   cb_data->lctx->tensor_capture_map[tensor_name].sample_count);
+                   cb_data->lctx->tensor_capture_map[tensor_name].sample_count,
+                   cb_data->lctx->tensor_capture_map[tensor_name].count);
 
     return true;  // Continue evaluation
 }
@@ -3845,6 +3858,8 @@ static bool is_dtype_exist(struct model_params * n_params, enum ggml_type dtype)
             return n_params->layer_q6k    > 0 || n_params->output_q6k    > 0;
         case GGML_TYPE_IQ2_XXS:
             return n_params->layer_iq2xxs > 0 || n_params->output_iq2xxs > 0;
+        case GGML_TYPE_IQ2_XS:
+            return n_params->layer_iq2xs  > 0 || n_params->output_iq2xs  > 0;
         case GGML_TYPE_Q5_0:
             return n_params->layer_q50    > 0 || n_params->output_q50    > 0;
         case GGML_TYPE_Q8_0:
@@ -3860,15 +3875,47 @@ static bool is_dtype_exist(struct model_params * n_params, enum ggml_type dtype)
     }
 }
 
+// ============================================================
+// Helper functions for model-agnostic FLOPS profiling
+// These wrappers allow calling device_*_flops with a NULL model
+// by using n_embd_override = 4096
+// ============================================================
+
+static float device_cpu_flops_impl(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads) {
+    if (model) {
+        return device_cpu_flops(model, src0t, src1t, n_threads);
+    }
+    // Call internal device_flops with NULL model and n_embd_override = 4096
+    return device_flops_internal(nullptr, src0t, src1t, PROFILER_BACKEND_TYPE_CPU, n_threads, 4096);
+}
+
+static float device_metal_flops_impl(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t) {
+    if (model) {
+        return device_metal_flops(model, src0t, src1t);
+    }
+    // Call internal device_flops with NULL model and n_embd_override = 4096
+    return device_flops_internal(nullptr, src0t, src1t, PROFILER_BACKEND_TYPE_METAL, 4, 4096);
+}
+
+static float device_cuda_flops_impl(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t) {
+    if (model) {
+        return device_cuda_flops(model, src0t, src1t);
+    }
+    // Call internal device_flops with NULL model and n_embd_override = 4096
+    return device_flops_internal(nullptr, src0t, src1t, PROFILER_BACKEND_TYPE_CUDA, 4, 4096);
+}
+
 void llama_profile_device(
-                device_info * dev_info, 
-         struct llama_model * model, 
-         llama_model_loader * ml, 
+                device_info * dev_info,
+         struct llama_model * model,
+         llama_model_loader * ml,
                         int   gpu_mem,
                         int   n_predict,
-                        int   n_ctx, 
+                        int   n_ctx,
                         int   n_threads,
-                       bool   flash_attn) {
+                       bool   flash_attn,
+                const char * model_stats_path,
+                       bool   ada_quant) {
     dev_info->device_name               = device_name();
     dev_info->device_os                 = device_os();
     dev_info->cpu_props.cores           = device_cpu_cores();
@@ -3885,14 +3932,50 @@ void llama_profile_device(
     dev_info->memory.cpu_read_ram_bw    = device_memory_bw(n_threads);
     dev_info->memory.mem_cpy_delay      = device_cpu_mem_copy(model, n_threads);
 
-    struct model_flops  * n_flops  = &dev_info->model_flops;
-    struct model_params * n_params = &dev_info->model_params;
-    struct model_bytes  * n_bytes  = &dev_info->model_bytes;   
+    const char *csv_stats_path = "/root/prima.cpp/Model_Statistics.csv";
 
-    enum ggml_type inp_embd_dtype  = GGML_TYPE_F32;
-    llama_model_loader_context loader_ctx(ml);
-    llama_model_n_flops(model, loader_ctx, n_flops, n_params, n_bytes, n_predict, n_ctx, &inp_embd_dtype, flash_attn);
-    n_flops->inp_embd_ms = device_inp_embd_delay(model, inp_embd_dtype, 1, n_threads);
+    if (ada_quant) {
+        // Only rank 0 needs to load CSV data for the HiGHS optimizer
+        if (dev_info->rank == 0) {
+            std::vector<model_statistics_entry> model_stats;
+
+            if (!load_model_statistics_from_csv(csv_stats_path, model_stats)) {
+                LLAMA_LOG_ERROR("Failed to load model statistics from CSV in adaptive quantization mode\n");
+                return;
+            }
+
+            // Store all model statistics in device_info for optimizer access
+            // This contains all model variants (llama_1, llama_2, llama_4, llama_8, llama_16, etc.)
+            // with complete data for all 13 quantization types
+            dev_info->model_stats_all = model_stats;
+
+            // Skip device_inp_embd_delay() test - not needed in adaptive mode
+
+            LLAMA_LOG_INFO("\n=== Adaptive Quantization Mode ===\n");
+            LLAMA_LOG_INFO("Loaded %zu model statistics from CSV:\n", model_stats.size());
+            for (const auto& entry : model_stats) {
+                LLAMA_LOG_INFO("  - %s: 13 quantization types available\n", entry.model_id.c_str());
+            }
+            LLAMA_LOG_INFO("Skipped model profiling (FLOPS/params/bytes computation)\n");
+            LLAMA_LOG_INFO("Skipped embedding layer delay test\n");
+            LLAMA_LOG_INFO("===============================\n\n");
+        } else {
+            // Worker nodes don't need CSV data - rank 0 will handle optimization
+            LLAMA_LOG_INFO("Rank %u: Skipping CSV load in adaptive quantization mode (rank 0 will handle optimization)\n",
+                           dev_info->rank);
+        }
+    } else {
+        struct model_flops  * n_flops  = &dev_info->model_flops;
+        struct model_params * n_params = &dev_info->model_params;
+        struct model_bytes  * n_bytes  = &dev_info->model_bytes;
+
+        if (model && ml) {
+            enum ggml_type inp_embd_dtype  = GGML_TYPE_F32;
+            llama_model_loader_context loader_ctx(ml);
+            llama_model_n_flops(model, loader_ctx, n_flops, n_params, n_bytes, n_predict, n_ctx, &inp_embd_dtype, flash_attn);
+            n_flops->inp_embd_ms = device_inp_embd_delay(model, inp_embd_dtype, 1, n_threads);
+        }
+    }
 
     device_disk_seq_bw(&dev_info->disk.read_seq_bw, &dev_info->disk.write_seq_bw, n_threads);
     device_disk_rnd_bw(&dev_info->disk.read_rnd_bw, &dev_info->disk.write_rnd_bw, n_threads);
@@ -3923,82 +4006,55 @@ void llama_profile_device(
     dev_info->gpu_props.cuda_read_vram_bw   = device_cuda_read_vram_bw();
     dev_info->gpu_props.metal_mem_cpy_delay = device_metal_mem_copy(model);
     dev_info->gpu_props.cuda_mem_cpy_delay  = device_cuda_mem_copy(model);
+    dev_info->gpu_props.cuda_pcie_bw        = device_cuda_pcie_bw();
 #else
     (void)gpu_mem;
 #endif
 
-    if (is_dtype_exist(n_params, GGML_TYPE_F32)) {
-        dev_info->cpu_props.flops_f32_f32         = device_cpu_flops  (model, GGML_TYPE_F32,  GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_f32_f32   = device_metal_flops(model, GGML_TYPE_F32,  GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_f32_f32    = device_cuda_flops (model, GGML_TYPE_F32,  GGML_TYPE_F32);
-    }
+    // CPU FLOPS - always measure all types
+    dev_info->cpu_props.flops_f32_f32         = device_cpu_flops_impl(model, GGML_TYPE_F32,     GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_f16_f32         = device_cpu_flops_impl(model, GGML_TYPE_F16,     GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_q2k_f32         = device_cpu_flops_impl(model, GGML_TYPE_Q2_K,    GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_q4k_f32         = device_cpu_flops_impl(model, GGML_TYPE_Q4_K,    GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_q5k_f32         = device_cpu_flops_impl(model, GGML_TYPE_Q5_K,    GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_q6k_f32         = device_cpu_flops_impl(model, GGML_TYPE_Q6_K,    GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_iq2xxs_f32      = device_cpu_flops_impl(model, GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_iq2xs_f32       = device_cpu_flops_impl(model, GGML_TYPE_IQ2_XS,  GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_q50_f32         = device_cpu_flops_impl(model, GGML_TYPE_Q5_0,    GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_q80_f32         = device_cpu_flops_impl(model, GGML_TYPE_Q8_0,    GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_iq1s_f32        = device_cpu_flops_impl(model, GGML_TYPE_IQ1_S,   GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_iq4nl_f32       = device_cpu_flops_impl(model, GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, n_threads);
+    dev_info->cpu_props.flops_iq1m_f32        = device_cpu_flops_impl(model, GGML_TYPE_IQ1_M,   GGML_TYPE_F32, n_threads);
 
-    if (is_dtype_exist(n_params, GGML_TYPE_F16)) {
-        dev_info->cpu_props.flops_f16_f32         = device_cpu_flops  (model, GGML_TYPE_F16,  GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_f16_f32   = device_metal_flops(model, GGML_TYPE_F16,  GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_f16_f32    = device_cuda_flops (model, GGML_TYPE_F16,  GGML_TYPE_F32);
-    }
+    // Metal FLOPS - always measure all types
+    dev_info->gpu_props.metal_flops_f32_f32   = device_metal_flops_impl(model, GGML_TYPE_F32,     GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_f16_f32   = device_metal_flops_impl(model, GGML_TYPE_F16,     GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_q2k_f32   = device_metal_flops_impl(model, GGML_TYPE_Q2_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_q4k_f32   = device_metal_flops_impl(model, GGML_TYPE_Q4_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_q5k_f32   = device_metal_flops_impl(model, GGML_TYPE_Q5_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_q6k_f32   = device_metal_flops_impl(model, GGML_TYPE_Q6_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_iq2xxs_f32= device_metal_flops_impl(model, GGML_TYPE_IQ2_XXS, GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_iq2xs_f32 = device_metal_flops_impl(model, GGML_TYPE_IQ2_XS,  GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_q50_f32   = device_metal_flops_impl(model, GGML_TYPE_Q5_0,    GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_q80_f32   = device_metal_flops_impl(model, GGML_TYPE_Q8_0,    GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_iq1s_f32  = device_metal_flops_impl(model, GGML_TYPE_IQ1_S,   GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_iq4nl_f32 = device_metal_flops_impl(model, GGML_TYPE_IQ4_NL,  GGML_TYPE_F32);
+    dev_info->gpu_props.metal_flops_iq1m_f32  = device_metal_flops_impl(model, GGML_TYPE_IQ1_M,   GGML_TYPE_F32);
 
-    if (is_dtype_exist(n_params, GGML_TYPE_Q2_K)) {
-        dev_info->cpu_props.flops_q2k_f32         = device_cpu_flops  (model, GGML_TYPE_Q2_K, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_q2k_f32   = device_metal_flops(model, GGML_TYPE_Q2_K, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_q2k_f32    = device_cuda_flops (model, GGML_TYPE_Q2_K, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_Q4_K)) {
-        dev_info->cpu_props.flops_q4k_f32         = device_cpu_flops  (model, GGML_TYPE_Q4_K, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_q4k_f32   = device_metal_flops(model, GGML_TYPE_Q4_K, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_q4k_f32    = device_cuda_flops (model, GGML_TYPE_Q4_K, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_Q5_K)) {
-        dev_info->cpu_props.flops_q5k_f32         = device_cpu_flops  (model, GGML_TYPE_Q5_K, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_q5k_f32   = device_metal_flops(model, GGML_TYPE_Q5_K, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_q5k_f32    = device_cuda_flops (model, GGML_TYPE_Q5_K, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_Q6_K)) {
-        dev_info->cpu_props.flops_q6k_f32         = device_cpu_flops  (model, GGML_TYPE_Q6_K, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_q6k_f32   = device_metal_flops(model, GGML_TYPE_Q6_K, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_q6k_f32    = device_cuda_flops (model, GGML_TYPE_Q6_K, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_IQ2_XXS)) {
-        dev_info->cpu_props.flops_iq2xxs_f32      = device_cpu_flops  (model, GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_iq2xxs_f32= device_metal_flops(model, GGML_TYPE_IQ2_XXS, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_iq2xxs_f32 = device_cuda_flops (model, GGML_TYPE_IQ2_XXS, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_Q5_0)) {
-        dev_info->cpu_props.flops_q50_f32         = device_cpu_flops  (model, GGML_TYPE_Q5_0, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_q50_f32   = device_metal_flops(model, GGML_TYPE_Q5_0, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_q50_f32    = device_cuda_flops (model, GGML_TYPE_Q5_0, GGML_TYPE_F32);
-    }
-
-
-    if (is_dtype_exist(n_params, GGML_TYPE_Q8_0)) {
-        dev_info->cpu_props.flops_q80_f32         = device_cpu_flops  (model, GGML_TYPE_Q8_0, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_q80_f32   = device_metal_flops(model, GGML_TYPE_Q8_0, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_q80_f32    = device_cuda_flops (model, GGML_TYPE_Q8_0, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_IQ1_S)) {
-        dev_info->cpu_props.flops_iq1s_f32        = device_cpu_flops  (model, GGML_TYPE_IQ1_S, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_iq1s_f32  = device_metal_flops(model, GGML_TYPE_IQ1_S, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_iq1s_f32   = device_cuda_flops (model, GGML_TYPE_IQ1_S, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_IQ4_NL)) {
-        dev_info->cpu_props.flops_iq4nl_f32       = device_cpu_flops   (model, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_iq4nl_f32 = device_metal_flops(model, GGML_TYPE_IQ4_NL, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_iq4nl_f32  = device_cuda_flops (model, GGML_TYPE_IQ4_NL, GGML_TYPE_F32);
-    }
-
-    if (is_dtype_exist(n_params, GGML_TYPE_IQ1_M)) {
-        dev_info->cpu_props.flops_iq1m_f32        = device_cpu_flops  (model, GGML_TYPE_IQ1_M, GGML_TYPE_F32, n_threads);
-        dev_info->gpu_props.metal_flops_iq1m_f32  = device_metal_flops(model, GGML_TYPE_IQ1_M, GGML_TYPE_F32);
-        dev_info->gpu_props.cuda_flops_iq1m_f32   = device_cuda_flops (model, GGML_TYPE_IQ1_M, GGML_TYPE_F32);
-    }
+    // CUDA FLOPS - always measure all types
+    dev_info->gpu_props.cuda_flops_f32_f32    = device_cuda_flops_impl(model, GGML_TYPE_F32,     GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_f16_f32    = device_cuda_flops_impl(model, GGML_TYPE_F16,     GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_q2k_f32    = device_cuda_flops_impl(model, GGML_TYPE_Q2_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_q4k_f32    = device_cuda_flops_impl(model, GGML_TYPE_Q4_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_q5k_f32    = device_cuda_flops_impl(model, GGML_TYPE_Q5_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_q6k_f32    = device_cuda_flops_impl(model, GGML_TYPE_Q6_K,    GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_iq2xxs_f32 = device_cuda_flops_impl(model, GGML_TYPE_IQ2_XXS, GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_iq2xs_f32  = device_cuda_flops_impl(model, GGML_TYPE_IQ2_XS,  GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_q50_f32    = device_cuda_flops_impl(model, GGML_TYPE_Q5_0,    GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_q80_f32    = device_cuda_flops_impl(model, GGML_TYPE_Q8_0,    GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_iq1s_f32   = device_cuda_flops_impl(model, GGML_TYPE_IQ1_S,   GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_iq4nl_f32  = device_cuda_flops_impl(model, GGML_TYPE_IQ4_NL,  GGML_TYPE_F32);
+    dev_info->gpu_props.cuda_flops_iq1m_f32   = device_cuda_flops_impl(model, GGML_TYPE_IQ1_M,   GGML_TYPE_F32);
 }
 
 ggml_backend_buffer_type_t llama_dev_buffer_type(struct llama_model * model, int device) {
@@ -4754,7 +4810,8 @@ static const char * llama_file_version_name(llama_fver version) {
 static std::string llama_format_tensor_shape(const std::vector<int64_t> & ne) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%5" PRId64, ne.at(0));
-    for (size_t i = 1; i < ne.size(); i++) {
+    size_t limit = std::min((size_t)2, ne.size());
+    for (size_t i = 1; i < limit; i++) {
         snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", %5" PRId64, ne.at(i));
     }
     return buf;
@@ -4763,7 +4820,7 @@ static std::string llama_format_tensor_shape(const std::vector<int64_t> & ne) {
 static std::string llama_format_tensor_shape(const struct ggml_tensor * t) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%5" PRId64, t->ne[0]);
-    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+    for (int i = 1; i < 2; i++) {
         snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", %5" PRId64, t->ne[i]);
     }
     return buf;
@@ -6005,6 +6062,47 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_M:    return "IQ3_S mix - 3.66 bpw";
 
         default: return "unknown, may not work";
+    }
+}
+
+static int llama_ftype_to_bitwidth(llama_ftype ftype) {
+    // Strip the GUESSED flag
+    enum llama_ftype ftype_clean = (enum llama_ftype)(ftype & ~LLAMA_FTYPE_GUESSED);
+
+    switch (ftype_clean) {
+        case LLAMA_FTYPE_ALL_F32:         return 32;
+        case LLAMA_FTYPE_MOSTLY_F16:      return 16;
+        case LLAMA_FTYPE_MOSTLY_BF16:     return 16;
+        case LLAMA_FTYPE_MOSTLY_Q4_0:     return 4;
+        case LLAMA_FTYPE_MOSTLY_Q4_1:     return 4;
+        case LLAMA_FTYPE_MOSTLY_Q5_0:     return 5;
+        case LLAMA_FTYPE_MOSTLY_Q5_1:     return 5;
+        case LLAMA_FTYPE_MOSTLY_Q8_0:     return 8;
+        case LLAMA_FTYPE_MOSTLY_Q2_K:
+        case LLAMA_FTYPE_MOSTLY_Q2_K_S:   return 2;
+        case LLAMA_FTYPE_MOSTLY_Q3_K_S:
+        case LLAMA_FTYPE_MOSTLY_Q3_K_M:
+        case LLAMA_FTYPE_MOSTLY_Q3_K_L:   return 3;
+        case LLAMA_FTYPE_MOSTLY_Q4_K_S:
+        case LLAMA_FTYPE_MOSTLY_Q4_K_M:   return 4;
+        case LLAMA_FTYPE_MOSTLY_Q5_K_S:
+        case LLAMA_FTYPE_MOSTLY_Q5_K_M:   return 5;
+        case LLAMA_FTYPE_MOSTLY_Q6_K:     return 6;
+        case LLAMA_FTYPE_MOSTLY_IQ1_S:
+        case LLAMA_FTYPE_MOSTLY_IQ1_M:    return 1;
+        case LLAMA_FTYPE_MOSTLY_IQ2_XXS:
+        case LLAMA_FTYPE_MOSTLY_IQ2_XS:
+        case LLAMA_FTYPE_MOSTLY_IQ2_S:
+        case LLAMA_FTYPE_MOSTLY_IQ2_M:    return 2;
+        case LLAMA_FTYPE_MOSTLY_IQ3_XS:
+        case LLAMA_FTYPE_MOSTLY_IQ3_XXS:
+        case LLAMA_FTYPE_MOSTLY_IQ3_S:
+        case LLAMA_FTYPE_MOSTLY_IQ3_M:    return 3;
+        case LLAMA_FTYPE_MOSTLY_IQ4_NL:
+        case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return 4;
+        case LLAMA_FTYPE_MOSTLY_TQ1_0:    return 1;
+        case LLAMA_FTYPE_MOSTLY_TQ2_0:    return 2;
+        default: return 0;
     }
 }
 
@@ -7658,6 +7756,11 @@ static void llm_load_llama_tensors(
     // Returns cpu_ml (primary) for CPU layers, gpu_ml (secondary) for GPU layers
     // Compare with model.buft_input.buft which is always CPU
     auto ml_for_layer = [&](int local_i) -> llama_model_loader & {
+        // In single precision mode, all layers use the same loader
+        if (!loader_ctx.is_mixed_precision) {
+            return *loader_ctx.primary;
+        }
+        // In mixed precision mode, use buffer type to select loader
         if (model.buft_layer[local_i].buft == model.buft_input.buft) {
             return *loader_ctx.primary; // CPU layer
         } else {
@@ -7705,7 +7808,7 @@ static void llm_load_llama_tensors(
         // Select appropriate loader based on layer's backend
         llama_model_loader & ml = ml_for_layer(local_i);
         const char * ml_type = (&ml == loader_ctx.primary) ? "cpu_ml" : "gpu_ml";
-        LLAMA_LOG_DEBUG("Layer %i (local index %i) using %s\n", i, local_i, ml_type);
+        // LLAMA_LOG_DEBUG("Layer %i (local index %i) using %s\n", i, local_i, ml_type);
 
         auto & layer = model.layers[local_i];
 
@@ -8073,6 +8176,11 @@ static bool llm_load_tensors_impl(
     // Helper function to select appropriate loader based on buffer type
     // CPU buffer type uses primary loader (cpu_ml), GPU uses secondary (gpu_ml)
     auto ml_for_buffer_type = [&](ggml_backend_buffer_type_t buft) -> llama_model_loader & {
+        // In single precision mode, all buffers use the same loader
+        if (!loader_ctx.is_mixed_precision) {
+            return *loader_ctx.primary;
+        }
+        // In mixed precision mode, use buffer type to select loader
         if (buft == model.buft_input.buft) {
             return *loader_ctx.primary; // CPU backend
         } else {
@@ -8332,7 +8440,34 @@ void llama_scan_tensor_minmax(struct llama_model_loader * ml) {
         return;
     }
 
+    int bitwidth = llama_ftype_to_bitwidth(ml->ftype);
+
+    // Use unified filename for all bitwidth models
+    const char * csv_filename = "tensor_minmax_stats_all.csv";
+
+    // Check if file exists to determine if we need to write header
+    bool file_exists = false;
+    {
+        std::ifstream check_file(csv_filename);
+        file_exists = check_file.good();
+    }
+
+    // Open file in append mode
+    std::ofstream csv_file(csv_filename, std::ios::app);
+
+    if (!csv_file.is_open()) {
+        LLAMA_LOG_INFO("%s: failed to open CSV file: %s\n", __func__, csv_filename);
+        return;
+    }
+
+    // Write header only if file is new
+    if (!file_exists) {
+        csv_file << "# tensor_minmax_stats - multiple bitwidths\n";
+        csv_file << "tensor_name,bit_width,elements,min,max,range,scale,type\n";
+    }
+
     bool use_file_io = ml->mappings.empty();
+    int tensor_count = 0;
 
     for (auto & weight : ml->weights) {
         ggml_tensor * tensor = weight.tensor;
@@ -8345,8 +8480,7 @@ void llama_scan_tensor_minmax(struct llama_model_loader * ml) {
         if (use_file_io) {
             // Read from file directly
             if (weight.idx >= ml->files.size()) {
-                LLAMA_LOG_INFO("%s: invalid file index %u\n", ggml_get_name(tensor), weight.idx);
-                continue;
+                continue;  // Skip invalid file index silently
             }
             llama_file * file = ml->files[weight.idx].get();
             read_buf.resize(nbytes);
@@ -8363,9 +8497,7 @@ void llama_scan_tensor_minmax(struct llama_model_loader * ml) {
         }
 
         if (data == nullptr) {
-            LLAMA_LOG_INFO("%s: no data available (%s)\n",
-                           ggml_get_name(tensor), ggml_type_name(tensor->type));
-            continue;
+            continue;  // Skip tensors with no data silently
         }
 
         float min_val = std::numeric_limits<float>::max();
@@ -8384,13 +8516,50 @@ void llama_scan_tensor_minmax(struct llama_model_loader * ml) {
                 min_val = std::min(min_val, val);
                 max_val = std::max(max_val, val);
             }
+        } else if (tensor->type == GGML_TYPE_BF16) {
+            const ggml_bf16_t * bf16_data = (const ggml_bf16_t *)data;
+            for (size_t i = 0; i < n_elements; i++) {
+                float val = ggml_bf16_to_fp32(bf16_data[i]);
+                min_val = std::min(min_val, val);
+                max_val = std::max(max_val, val);
+            }
+        } else if (ggml_is_quantized(tensor->type)) {
+            // Handle all quantized types using dequantization
+            ggml_type_traits_t type_traits = ggml_internal_get_type_traits(tensor->type);
+            if (type_traits.to_float != NULL) {
+                std::vector<float> dequantized_data(n_elements);
+                type_traits.to_float(data, dequantized_data.data(), n_elements);
+                for (size_t i = 0; i < n_elements; i++) {
+                    min_val = std::min(min_val, dequantized_data[i]);
+                    max_val = std::max(max_val, dequantized_data[i]);
+                }
+            } else {
+                continue;  // Skip quantized types without dequantization function
+            }
         } else {
-            continue;
+            continue;  // Skip other unsupported types
         }
 
-        LLAMA_LOG_INFO("%s: min=%.6f, max=%.6f (%s)\n",
-                       ggml_get_name(tensor), min_val, max_val, ggml_type_name(tensor->type));
+        float range = max_val - min_val;
+        // Calculate scaling factor: S_W = (W_max - W_min) / (2^b - 1)
+        double scaling_factor = range / (pow(2.0, bitwidth) - 1.0);
+
+        // Write to CSV with bit_width column
+        csv_file << ggml_get_name(tensor) << ","
+                 << bitwidth << ","
+                 << n_elements << ","
+                 << std::fixed << std::setprecision(6) << min_val << ","
+                 << std::fixed << std::setprecision(6) << max_val << ","
+                 << std::fixed << std::setprecision(6) << range << ","
+                 << std::setprecision(6) << scaling_factor << ","
+                 << ggml_type_name(tensor->type) << "\n";
+
+        tensor_count++;
     }
+
+    csv_file.close();
+
+    LLAMA_LOG_INFO("%s: wrote %d tensor stats (bit_width=%d) to %s\n", __func__, tensor_count, bitwidth, csv_filename);
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
@@ -16812,6 +16981,40 @@ void llama_send_meta(llama_context * ctx, struct sync_meta * meta) {
     }
 }
 
+// Helper function to free dynamically allocated memory in sync_meta
+// This should be called after llama_recv_meta when the meta data is no longer needed
+static void llama_sync_meta_cleanup(struct sync_meta * meta) {
+    if (meta == nullptr) {
+        return;
+    }
+
+    // Free seq_id data block and pointer array
+    if (meta->seq_id != nullptr) {
+        // The data block is stored in seq_id[0] (contiguous allocation)
+        // Free the data block first
+        if (meta->seq_id[0] != nullptr) {
+            free(meta->seq_id[0]);
+        }
+        // Then free the pointer array
+        free(meta->seq_id);
+        meta->seq_id = nullptr;
+    }
+
+    // Free other allocated fields
+    if (meta->pos != nullptr) {
+        free(meta->pos);
+        meta->pos = nullptr;
+    }
+    if (meta->n_seq_id != nullptr) {
+        free(meta->n_seq_id);
+        meta->n_seq_id = nullptr;
+    }
+    if (meta->logits != nullptr) {
+        free(meta->logits);
+        meta->logits = nullptr;
+    }
+}
+
 int llama_recv_meta(llama_context * ctx, struct sync_meta * meta) {
     zmq::socket_t * recv_socket = ctx->recv_socket;
     GGML_ASSERT(recv_socket != nullptr);
@@ -16938,11 +17141,30 @@ int llama_recv_meta(llama_context * ctx, struct sync_meta * meta) {
                 const int32_t n_tokens = meta->n_tokens;
                 const int32_t n_seq_max = 1;
                 GGML_ASSERT(data_msg.size() == (size_t)n_tokens * n_seq_max * sizeof(llama_seq_id));
+
+                // Allocate pointer array
                 meta->seq_id = (llama_seq_id **) malloc(n_tokens * sizeof(llama_seq_id *));
+                if (meta->seq_id == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate seq_id pointer array\n", __func__);
+                    return -1;
+                }
+
+                // Allocate contiguous data block for all seq_id data
+                // Store the data pointer in seq_id[0] so it can be freed later
+                llama_seq_id * seq_id_data = (llama_seq_id *) malloc(n_tokens * n_seq_max * sizeof(llama_seq_id));
+                if (seq_id_data == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate seq_id data block\n", __func__);
+                    free(meta->seq_id);
+                    meta->seq_id = nullptr;
+                    return -1;
+                }
+
                 const llama_seq_id * flat_data = (const llama_seq_id *)data_msg.data();
+                std::memcpy(seq_id_data, flat_data, n_tokens * n_seq_max * sizeof(llama_seq_id));
+
+                // Set up pointers to point into the contiguous data block
                 for (int32_t token_idx = 0; token_idx < n_tokens; ++token_idx) {
-                    meta->seq_id[token_idx] = (llama_seq_id *) malloc(n_seq_max * sizeof(llama_seq_id));
-                    std::memcpy(meta->seq_id[token_idx], flat_data + token_idx * n_seq_max, n_seq_max * sizeof(llama_seq_id));
+                    meta->seq_id[token_idx] = seq_id_data + token_idx * n_seq_max;
                 }
             }
         } else if (key == "logits") {
@@ -17247,6 +17469,7 @@ static int llama_decode_internal(
                         [&]{ llama_send_kv_cache_clear  (&lctx); },
                         is_last_dev)) {
                 LLAMA_LOG_DEBUG("%s: received signal kv_cache_clear\n", __func__);
+                llama_sync_meta_cleanup(&meta);
                 return -1;
             }
 
@@ -17255,6 +17478,7 @@ static int llama_decode_internal(
                         [&]{ llama_send_kv_cache_seq_rm (&lctx, meta.rm_seq_id, meta.rm_p0, meta.rm_p1); },
                         is_last_dev)) {
                 LLAMA_LOG_DEBUG("%s: received signal kv_cache_seq_rm\n", __func__);
+                llama_sync_meta_cleanup(&meta);
                 return -1;
             }
 
@@ -17263,6 +17487,7 @@ static int llama_decode_internal(
                         [&]{ llama_send_kv_cache_seq_add(&lctx, meta.add_seq_id, meta.add_p0, meta.add_p1, meta.add_delta); },
                         is_last_dev)) {
                 LLAMA_LOG_DEBUG("%s: received signal kv_cache_seq_add\n", __func__);
+                llama_sync_meta_cleanup(&meta);
                 return -1;
             }
 
@@ -17271,6 +17496,7 @@ static int llama_decode_internal(
                         [&]{ llama_send_kv_cache_seq_cp (&lctx, meta.cp_src_seq_id, meta.cp_dst_seq_id, meta.cp_p0, meta.cp_p1); },
                         is_last_dev)) {
                 LLAMA_LOG_DEBUG("%s: received signal kv_cache_seq_cp\n", __func__);
+                llama_sync_meta_cleanup(&meta);
                 return -1;
             }
 
@@ -17279,6 +17505,7 @@ static int llama_decode_internal(
                         [&]{ llama_send_kv_cache_seq_keep(&lctx, meta.keep_seq_id); },
                         is_last_dev)) {
                 LLAMA_LOG_DEBUG("%s: received signal kv_cache_seq_keep\n", __func__);
+                llama_sync_meta_cleanup(&meta);
                 return -1;
             }
 
@@ -17287,8 +17514,12 @@ static int llama_decode_internal(
                         [&]{ llama_send_kv_cache_seq_div(&lctx, meta.div_seq_id, meta.div_p0, meta.div_p1, meta.div_factor); },
                         is_last_dev)) {
                 LLAMA_LOG_DEBUG("%s: received signal kv_cache_seq_div\n", __func__);
+                llama_sync_meta_cleanup(&meta);
                 return -1;
             }
+
+            // Clean up dynamically allocated memory in sync_meta
+            llama_sync_meta_cleanup(&meta);
         }
 
         if (!is_last_dev) {
@@ -19277,8 +19508,8 @@ struct llama_context_params llama_context_default_params() {
         /*.keep_out_in_cuda            =*/ false,
         /*.master_ip                   =*/ nullptr,
         /*.next_node_ip                =*/ nullptr,
-        /*.data_port                   =*/ 9000,
-        /*.signal_port                 =*/ 10000,
+        /*.data_port                   =*/ 9005,
+        /*.signal_port                 =*/ 10032,
         /*.n_ctx                       =*/ 512,
         /*.n_predict                   =*/ 512,
         /*.n_batch                     =*/ 2048,
@@ -19856,6 +20087,24 @@ int llama_recv_layer_setup(struct llama_context * ctx, uint32_t * n_layer_window
         return -1;
     }
 
+    // Check for ada-quant exit signal
+    if (msgs[0].to_string() == "ADA_QUANT_EXIT") {
+        LLAMA_LOG_INFO("Received ada-quant exit signal from master rank\n");
+        // Forward the exit message to next rank
+        if (my_rank != n_world - 1) {
+            zmq::send_multipart(*ctx->send_socket, msgs);
+            // Wait for ack from last rank
+            std::vector<zmq::message_t> ack_msgs;
+            zmq::recv_multipart(*ctx->recv_socket, std::back_inserter(ack_msgs));
+        } else {
+            // Last rank sends ack back to master
+            std::vector<zmq::message_t> ack;
+            ack.emplace_back("ACK", strlen("ACK"));
+            zmq::send_multipart(*ctx->send_socket, ack);
+        }
+        return -2;  // Special return code for ada-quant exit
+    }
+
     GGML_ASSERT(msgs[0].to_string() == "n_layer_window");
     GGML_ASSERT(msgs[1].size() == sizeof(uint32_t) * 32);
     memcpy(n_layer_window, msgs[1].data(), sizeof(uint32_t) * 32);
@@ -19878,7 +20127,36 @@ int llama_recv_layer_setup(struct llama_context * ctx, uint32_t * n_layer_window
         LLAMA_LOG_INFO("Failed to send data: %s\n", e.what());
         return -1;
     }
-    
+
+    return 0;
+}
+
+// Broadcast ada-quant exit message to all ranks
+int llama_bcast_adaquant_exit(struct llama_context * ctx) {
+    uint32_t n_world = ctx->cparams.n_world;
+    if (n_world == 1) return 0;
+    GGML_ASSERT(ctx != nullptr && ctx->send_socket != nullptr);
+
+    std::vector<zmq::message_t> msgs;
+
+    try {
+        msgs.emplace_back("ADA_QUANT_EXIT", strlen("ADA_QUANT_EXIT"));
+        msgs.emplace_back("n_layer_window", strlen("n_layer_window"));
+        uint32_t empty_window[32] = {0};
+        msgs.emplace_back(empty_window, sizeof(uint32_t) * 32);
+
+        zmq::send_multipart(*ctx->send_socket, msgs);
+    } catch (const zmq::error_t & e) {
+        LLAMA_LOG_INFO("Failed to send ada-quant exit message: %s\n", e.what());
+        return -1;
+    }
+
+    // Receive ack from previous rank
+    msgs.clear();
+    if (!zmq::recv_multipart(*ctx->recv_socket, std::back_inserter(msgs))) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -20700,6 +20978,9 @@ static void count_n_flops(struct model_flops * n_flops, enum ggml_type dtype, en
                 case GGML_TYPE_IQ2_XXS:
                     n_flops->output_iq2xxs_f32 += n;
                     break;
+                case GGML_TYPE_IQ2_XS:
+                    n_flops->output_iq2xs_f32 += n;
+                    break;
                 case GGML_TYPE_Q5_0:
                     n_flops->output_q50_f32    += n;
                     break;
@@ -20742,6 +21023,9 @@ static void count_n_flops(struct model_flops * n_flops, enum ggml_type dtype, en
                     break;
                 case GGML_TYPE_IQ2_XXS:
                     n_flops->layer_iq2xxs_f32 += n;
+                    break;
+                case GGML_TYPE_IQ2_XS:
+                    n_flops->layer_iq2xs_f32 += n;
                     break;
                 case GGML_TYPE_Q5_0:
                     n_flops->layer_q50_f32    += n;
@@ -20794,6 +21078,9 @@ static void count_n_params(struct model_params * n_params, enum ggml_type dtype,
                 case GGML_TYPE_IQ2_XXS:
                     n_params->input_iq2xxs += n_i64t;
                     break;
+                case GGML_TYPE_IQ2_XS:
+                    n_params->input_iq2xs  += n_i64t;
+                    break;
                 case GGML_TYPE_Q5_0:
                     n_params->input_q50    += n_i64t;
                     break;
@@ -20837,6 +21124,9 @@ static void count_n_params(struct model_params * n_params, enum ggml_type dtype,
                 case GGML_TYPE_IQ2_XXS:
                     n_params->output_iq2xxs += n_i64t;
                     break;
+                case GGML_TYPE_IQ2_XS:
+                    n_params->output_iq2xs  += n_i64t;
+                    break;
                 case GGML_TYPE_Q5_0:
                     n_params->output_q50    += n_i64t;
                     break;
@@ -20879,6 +21169,9 @@ static void count_n_params(struct model_params * n_params, enum ggml_type dtype,
                     break;
                 case GGML_TYPE_IQ2_XXS:
                     n_params->layer_iq2xxs  += n_i64t;
+                    break;
+                case GGML_TYPE_IQ2_XS:
+                    n_params->layer_iq2xs   += n_i64t;
                     break;
                 case GGML_TYPE_Q5_0:
                     n_params->layer_q50     += n_i64t;
@@ -23614,6 +23907,17 @@ void llama_clear_tensor_capture(struct llama_context * ctx) {
     if (ctx) {
         ctx->tensor_capture_map.clear();
         LLAMA_LOG_INFO("%s: cleared all captured tensor data\n", __func__);
+    }
+}
+
+void llama_clear_tensor_capture_raw_data(struct llama_context * ctx) {
+    if (ctx) {
+        for (auto & kv : ctx->tensor_capture_map) {
+            // Clear raw_data but preserve Welford statistics (count, mean, M2)
+            kv.second.raw_data.clear();
+            kv.second.raw_data.shrink_to_fit();
+        }
+        LLAMA_LOG_INFO("%s: cleared raw data buffers (preserved Welford statistics)\n", __func__);
     }
 }
 

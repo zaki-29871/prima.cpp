@@ -5,7 +5,9 @@ BUILD_TARGETS = \
 	llama-speculative \
 	llama-gguf-split \
 	profile-tool \
-	llama-perplexity
+	llama-perplexity \
+	llama-ada-quant \
+	test-sensitivity
 
 # BUILD_TARGETS = \
 # 	libllava.a \
@@ -1273,6 +1275,7 @@ clean:
 	rm -rvf tests/*.o
 	rm -rvf examples/*.o
 	rm -rvf common/*.o
+	rm -rvf tools/*.o
 	rm -rvf *.a
 	rm -rvf *.dll
 	rm -rvf *.so
@@ -1550,6 +1553,16 @@ llama-minicpmv-cli: examples/llava/minicpmv-cli.cpp \
 	$(CXX) $(CXXFLAGS) $< $(filter-out %.h $<,$^) -o $@ $(LDFLAGS) -Wno-cast-qual
 
 profile-tool: tools/profile_tool.cpp \
+	$(OBJ_ALL)
+	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+
+llama-ada-quant: tools/ada_quant.cpp \
+	$(OBJ_ALL)
+	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+
+test-sensitivity: tools/test_sensitivity.cpp \
 	$(OBJ_ALL)
 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)

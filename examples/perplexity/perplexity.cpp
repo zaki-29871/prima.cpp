@@ -796,7 +796,7 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
                 }
             }   
 
-            if (llama_decode(ctx, batch)) {
+            if (llama_decode(ctx, batch, true)) {
                 LOG_INF("%s : failed to eval\n", __func__);
                 return {tokens, -1, logit_history, prob_history};
             }
@@ -857,14 +857,20 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
         if (my_rank == 0) {
             double current_ppl = std::exp(nll / count);
             double progress = ((double)(i + n_seq_batch)) / n_chunk * 100.0;
-            
-            LOG_INF("Rank 0: Chunk %d/%d (%.1f%%) completed, current_ppl = %.4lf\n", 
+
+            LOG_INF("Rank 0: Chunk %d/%d (%.1f%%) completed, current_ppl = %.4lf\n",
                     i + n_seq_batch, n_chunk, progress, current_ppl);
         } else {
             double progress = ((double)(i + n_seq_batch)) / n_chunk * 100.0;
-            
-            LOG_INF("Rank %d: Chunk %d/%d (%.1f%%) completed\n", 
+
+            LOG_INF("Rank %d: Chunk %d/%d (%.1f%%) completed\n",
                     my_rank, i + n_seq_batch, n_chunk, progress);
+        }
+
+        // Clear tensor capture raw data after each chunk to prevent memory accumulation
+        // while preserving Welford statistics for variance calculation across all chunks
+        if (params.tensor_capture) {
+            llama_clear_tensor_capture_raw_data(ctx);
         }
     }
     LOG("\n");
@@ -2278,6 +2284,11 @@ int main(int argc, char ** argv) {
     if (my_rank == 0) {
         write_logfile(ctx, params, model, results);
         llama_perf_context_print(ctx);
+
+        // Print tensor capture stats if enabled
+        if (params.tensor_capture) {
+            llama_print_tensor_capture_stats(ctx);
+        }
     }  
 
     if (n_world > 1) {

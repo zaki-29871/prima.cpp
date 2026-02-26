@@ -518,14 +518,16 @@ extern "C" {
     LLAMA_API void llama_backend_init(void);
 
     LLAMA_API void llama_profile_device(
-                       struct device_info * dev_info, 
-                       struct llama_model * model, 
+                       struct device_info * dev_info,
+                       struct llama_model * model,
                 struct llama_model_loader * ml,
                                       int   cuda_mem,
                                       int   n_predict,
                                       int   n_ctx,
                                       int   n_threads,
-                                     bool   flash_attn);
+                                     bool   flash_attn,
+                             const char * model_stats_path,
+                                     bool   ada_quant = false);  // adaptive quantization mode
 
     LLAMA_API ggml_backend_buffer_type_t llama_dev_buffer_type(struct llama_model * model, int device);
 
@@ -562,6 +564,7 @@ extern "C" {
     LLAMA_API int  llama_send_device_info  (struct llama_context * ctx, struct device_info * dev_info);
     LLAMA_API int  llama_bcast_startup_args(struct llama_context * ctx, uint32_t rank, struct startup_args * args);
     LLAMA_API int  llama_bcast_layer_setup (struct llama_context * ctx, uint32_t * n_layer_window, uint32_t * n_gpu_layers);
+    LLAMA_API int  llama_bcast_adaquant_exit(struct llama_context * ctx);
     LLAMA_API int  llama_rebuild_topo      (struct llama_context * ctx, 
                                                         uint32_t * n_layer_window, 
                                               struct device_info * desv_info_set, 
@@ -1523,6 +1526,11 @@ extern "C" {
     /// @details Clear all captured tensor data
     /// @param ctx The llama context
     LLAMA_API void llama_clear_tensor_capture(struct llama_context * ctx);
+
+    /// @details Clear only raw data buffers while preserving Welford statistics
+    ///          This allows memory management without losing accumulated variance data
+    /// @param ctx The llama context
+    LLAMA_API void llama_clear_tensor_capture_raw_data(struct llama_context * ctx);
 
     /// @details Get the overall variance for a captured tensor (all tokens, all elements)
     /// @param ctx The llama context
